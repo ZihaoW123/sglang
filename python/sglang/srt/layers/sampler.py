@@ -54,6 +54,9 @@ if _use_aiter:
 # torch.argmax (which always returns a valid index). Default off so behavior is
 # unchanged elsewhere.
 _disable_aiter_greedy_sample = get_bool_env_var("SGLANG_DISABLE_AITER_GREEDY_SAMPLE")
+_consistency_fp32_sampler_logprob = get_bool_env_var(
+    "SLIME_CONSISTENCY_FP32_SAMPLER_LOGPROB"
+)
 
 if is_npu():
     import torch_npu
@@ -144,11 +147,24 @@ class Sampler(nn.Module):
 
             # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
             logprobs_via_logsoftmax_kernel = None
-            if self.rl_on_policy_target is not None:
+            if self.rl_on_policy_target is not None and not self.use_ascend_backend:
                 # TODO: use more inplace ops to save memory
-                logits_div_temperature = (
-                    logits.bfloat16().div(sampling_info.temperatures).bfloat16()
-                )
+                # The historical RL path quantizes logits to BF16 both before and
+                # after temperature scaling. Megatron computes mismatch metrics
+                # from FP32 gathered logits, so that extra quantization alone can
+                # create ~1e-2 token logprob deltas. Keep the production default,
+                # but allow controlled consistency runs to compare equivalent FP32
+                # distributions without changing the sampled token path.
+                if _consistency_fp32_sampler_logprob:
+                    logits_div_temperature = logits.float().div(
+                        sampling_info.temperatures.float()
+                    )
+                else:
+                    logits_div_temperature = (
+                        logits.bfloat16()
+                        .div(sampling_info.temperatures)
+                        .bfloat16()
+                    )
                 logprobs_via_logsoftmax_kernel = torch.log_softmax(
                     logits_div_temperature, dim=-1
                 )
@@ -336,13 +352,35 @@ class Sampler(nn.Module):
             A tuple of (batch_next_token_ids, logprobs). logprobs is None
             when return_logprob is False or SGLANG_RETURN_ORIGINAL_LOGPROB is set.
         """
+        # Preserve the historical BF16/in-place sampling path. For controlled
+        # consistency runs, compute only the returned rollout distribution in
+        # FP32 before the in-place temperature division. This makes it
+        # numerically equivalent to Megatron without changing sampled tokens.
+        consistency_logprobs = None
+        if (
+            _consistency_fp32_sampler_logprob
+            and return_logprob
+            and not SGLANG_RETURN_ORIGINAL_LOGPROB
+        ):
+            logits_div_temperature = logits.float().div(
+                sampling_info.temperatures.float()
+            )
+            consistency_logprobs = torch.log_softmax(
+                logits_div_temperature, dim=-1
+            )
+            del logits_div_temperature
+
         logits.div_(sampling_info.temperatures)
         batch_next_token_ids = self._sample_from_logits(
             logits, sampling_info, simple_sampling_case, positions
         )
         logprobs = None
         if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
-            logprobs = torch.log_softmax(logits, dim=-1)
+            logprobs = (
+                consistency_logprobs
+                if consistency_logprobs is not None
+                else torch.log_softmax(logits, dim=-1)
+            )
         return batch_next_token_ids, logprobs
 
     def _attach_logprobs_to_output(

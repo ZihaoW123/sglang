@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -2233,6 +2234,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             prev_topk_indices=prev_topk_indices,
         )
+        if os.getenv("SLIME_CONSISTENCY_ZERO_ATTN", "0") == "1":
+            if isinstance(hidden_states, tuple):
+                hidden_states = (torch.zeros_like(hidden_states[0]), *hidden_states[1:])
+            else:
+                hidden_states = torch.zeros_like(hidden_states)
         if isinstance(hidden_states, tuple):
             hidden_states, topk_indices = hidden_states
         else:
@@ -2257,25 +2263,37 @@ class DeepseekV2DecoderLayer(nn.Module):
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
 
-        if (
-            isinstance(self.mlp, DeepseekV2MoE)
-            and not self.mlp.experts.moe_runner_config.inplace
-            and not torch.compiler.is_compiling()
-        ):
-            from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
-
-            _mlp_ctx = moe_output_buffer_ctx(hidden_states_orig)
+        selected_layers = {
+            int(value.strip())
+            for value in os.getenv("SLIME_CONSISTENCY_ZERO_MLP_LAYERS", "").split(",")
+            if value.strip()
+        }
+        zero_mlp = (
+            os.getenv("SLIME_CONSISTENCY_ZERO_MLP", "0") == "1"
+            or self.layer_id in selected_layers
+        )
+        if zero_mlp:
+            hidden_states = torch.zeros_like(hidden_states)
         else:
-            _mlp_ctx = nullcontext()
+            if (
+                isinstance(self.mlp, DeepseekV2MoE)
+                and not self.mlp.experts.moe_runner_config.inplace
+                and not torch.compiler.is_compiling()
+            ):
+                from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
 
-        with _mlp_ctx:
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                should_allreduce_fusion,
-                use_reduce_scatter,
-                gemm_output_zero_allocator,
-            )
+                _mlp_ctx = moe_output_buffer_ctx(hidden_states_orig)
+            else:
+                _mlp_ctx = nullcontext()
+
+            with _mlp_ctx:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    should_allreduce_fusion,
+                    use_reduce_scatter,
+                    gemm_output_zero_allocator,
+                )
 
         if (
             not (self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp)

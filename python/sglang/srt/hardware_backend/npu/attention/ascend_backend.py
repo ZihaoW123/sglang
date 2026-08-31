@@ -1051,6 +1051,12 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv,
             )
         else:
+            attention_output_dtype = q_nope.dtype
+            if attention_output_dtype == torch.float32:
+                q_nope = q_nope.to(torch.bfloat16)
+                k_nope = k_nope.to(torch.bfloat16)
+                q_pe = q_pe.to(torch.bfloat16)
+                k_pe = k_pe.to(torch.bfloat16)
             attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                 query=q_nope,
                 key=k_nope,
@@ -1073,6 +1079,8 @@ class AscendAttnBackend(AttentionBackend):
                 attention_mode=2,
                 return_softmax_lse=False,
             )
+            if attn_out.dtype != attention_output_dtype:
+                attn_out = attn_out.to(attention_output_dtype)
 
         return attn_out
 

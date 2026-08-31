@@ -2243,9 +2243,19 @@ class Indexer(MultiPlatformOp):
                 else block_table
             )
 
+            index_query = q.view(-1, self.n_heads, self.head_dim)
+            index_key = past_key_states
+            # Ascend LightningIndexer does not accept FP32 query/key. Keep only
+            # the discrete top-k selection in BF16 for FP32 consistency tests.
+            # The operator returns integer indices, so no floating-point value
+            # from this compatibility cast is fed back into the model.
+            if index_query.dtype == torch.float32:
+                index_query = index_query.to(torch.bfloat16)
+                index_key = index_key.to(torch.bfloat16)
+
             topk_indices = torch_npu.npu_lightning_indexer(
-                query=q.view(-1, self.n_heads, self.head_dim),
-                key=past_key_states,
+                query=index_query,
+                key=index_key,
                 weights=weights,
                 actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
                 actual_seq_lengths_key=actual_seq_lengths_kv.to(k.device).to(

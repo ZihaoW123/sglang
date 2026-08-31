@@ -2213,6 +2213,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         reconstructed_tensors = bucket.reconstruct_tensors()
 
+        # Flattened IPC buckets reconstruct named tensors as shared-storage
+        # views. Ascend weight-loader kernels require zero storage offsets.
+        reconstructed_tensors = [
+            (name, tensor.clone()) for name, tensor in reconstructed_tensors
+        ]
+
         # Load the reconstructed tensors using the standard method
         self.model.load_weights(reconstructed_tensors)
 
@@ -3417,7 +3423,13 @@ def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tenso
 def _unwrap_tensor(tensor, tp_rank, device):
     if isinstance(tensor, LocalSerializedTensor):
         tensor = tensor.get(tp_rank)
-    return tensor.to(device)
+    tensor = tensor.to(device)
+    # IPC can deserialize a tensor as a view into larger shared storage.
+    # Ascend kernels declare results with non-zero storage offsets untrustworthy.
+    # Materialize independent storage before model weight loaders consume it.
+    if tensor.storage_offset() != 0:
+        tensor = tensor.clone()
+    return tensor
 
 
 def _build_step_span_name(forward_batch: ForwardBatch) -> str:

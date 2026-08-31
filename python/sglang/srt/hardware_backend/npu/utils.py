@@ -1,5 +1,6 @@
 import functools
 import logging
+import os
 import sys
 from enum import IntEnum
 from typing import TYPE_CHECKING, Callable
@@ -111,7 +112,14 @@ def init_npu_backend():
     # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
     torch.cuda.is_available = lambda: False
 
-    torch_npu.npu.config.allow_internal_format = True
+    internal_format_mode = os.getenv("SLIME_NPU_INTERNAL_FORMAT", "enable").strip().lower()
+    if internal_format_mode not in {"enable", "disable"}:
+        raise ValueError(
+            "SLIME_NPU_INTERNAL_FORMAT must be 'enable' or 'disable', "
+            f"got {internal_format_mode!r}"
+        )
+    torch_npu.npu.config.allow_internal_format = internal_format_mode == "enable"
+    logger.warning("NPU internal format mode: %s", internal_format_mode)
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
 

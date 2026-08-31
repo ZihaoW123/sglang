@@ -15,6 +15,7 @@
 """Inference-only GLM-4.5, GLM-4.6 and GLM-4.7 model compatible with HuggingFace weights"""
 
 import logging
+import os
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -1339,6 +1340,13 @@ class Glm4MoeForCausalLM(nn.Module):
         weight_names = []
         for name, loaded_weight in weights:
             weight_names.append(name)
+            if (
+                os.environ.get("SLIME_CONSISTENCY_WEIGHT_TRACE") == "1"
+                and name == "model.layers.3.mlp.experts.0.gate_proj.weight"
+            ):
+                sample = loaded_weight.flatten()[:64].float().cpu().tolist()
+                print(f"SLIME_WEIGHT_TRACE received gate expert0 {sample}", flush=True)
+
 
             if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):

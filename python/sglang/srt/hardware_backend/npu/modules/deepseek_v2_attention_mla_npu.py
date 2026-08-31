@@ -1,3 +1,4 @@
+import os
 import re
 from typing import TYPE_CHECKING
 
@@ -345,7 +346,17 @@ def forward_dsa_prepare_npu(
             zero_allocator,
         )
     else:
-        fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+        if os.getenv("SLIME_CONSISTENCY_SPLIT_QKV_A_PROJ", "0") == "1":
+            fused_weight = m.fused_qkv_a_proj_with_mqa.weight
+            q_proj_out = torch.nn.functional.linear(
+                hidden_states, fused_weight[: m.q_lora_rank]
+            )
+            kv_proj_out = torch.nn.functional.linear(
+                hidden_states, fused_weight[m.q_lora_rank :]
+            )
+            fused_qkv_a_proj_out = torch.cat((q_proj_out, kv_proj_out), dim=-1)
+        else:
+            fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
         if m.rotary_emb.is_neox_style:
             q, latent_cache = fused_qkv_a_proj_out.split(
                 [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
@@ -380,8 +391,10 @@ def forward_dsa_prepare_npu(
             if q_event is not None:
                 torch.npu.current_stream().wait_event(q_event)
         else:
-            if fused_qkv_a_proj_out.shape[0] < 65535 and not dsa_use_prefill_cp(
-                forward_batch
+            if (
+                fused_qkv_a_proj_out.shape[0] < 65535
+                and not dsa_use_prefill_cp(forward_batch)
+                and os.getenv("SLIME_CONSISTENCY_EXPLICIT_QK_NORM", "0") != "1"
             ):
                 q_lora, k_nope, k_pe = fused_split_qk_norm(
                     fused_qkv_a_proj_out,
@@ -494,7 +507,12 @@ def forward_dsa_core_npu(
         )
     else:
         attn_output = attn_output.contiguous()
-        torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+        if attn_output.dtype == torch.float32:
+            # The fused NPU kernel only supports FP16/BF16. Preserve the FP32
+            # consistency diagnostic with the mathematically equivalent path.
+            attn_bmm_output = torch.einsum("thk,hkv->thv", attn_output, m.w_vc)
+        else:
+            torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 
