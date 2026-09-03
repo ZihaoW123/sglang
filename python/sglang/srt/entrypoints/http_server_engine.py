@@ -29,8 +29,13 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
                     "Content-Type": "application/json; charset=utf-8",
                     "Authorization": f"Bearer {server_args.api_key}",
                 }
+                # Respect SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION through the
+                # regular health endpoint. Hard-coding /health_generate here
+                # forces a real first request even when generation probes are
+                # disabled, which can block NPU/DeepEP startup and router
+                # metadata discovery.
                 response = session.get(
-                    f"{base_url}/health_generate", headers=headers, verify=ssl_verify
+                    f"{base_url}/health", headers=headers, verify=ssl_verify
                 )
                 if response.status_code == 200:
                     return p

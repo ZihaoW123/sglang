@@ -14,6 +14,7 @@
 
 import concurrent.futures
 import logging
+import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -71,6 +72,40 @@ logger = logging.getLogger(__name__)
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
 
 
+def remap_checkpoint_layer_indices(
+    weights: Iterable[Tuple[str, torch.Tensor]], layer_index_map: List[int]
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Map selected checkpoint layers onto compact runtime layer indices.
+
+    ``layer_index_map[target] == source``.  Tensors from unselected source
+    layers are skipped, while embedding/head tensors pass through unchanged.
+    This lets a reduced config reuse symlinks to the original checkpoint
+    shards without copying or rewriting the tensors.
+    """
+
+    if not layer_index_map:
+        raise ValueError("layer_index_map must contain at least one source layer")
+    if any(not isinstance(layer, int) or layer < 0 for layer in layer_index_map):
+        raise ValueError("layer_index_map entries must be non-negative integers")
+    if len(set(layer_index_map)) != len(layer_index_map):
+        raise ValueError("layer_index_map entries must be unique")
+
+    source_to_target = {
+        source_layer: target_layer
+        for target_layer, source_layer in enumerate(layer_index_map)
+    }
+    layer_pattern = re.compile(r"^(model\.layers\.)(\d+)(\..+)$")
+    for name, tensor in weights:
+        match = layer_pattern.match(name)
+        if match is None:
+            yield name, tensor
+            continue
+        source_layer = int(match.group(2))
+        target_layer = source_to_target.get(source_layer)
+        if target_layer is not None:
+            yield f"{match.group(1)}{target_layer}{match.group(3)}", tensor
+
+
 def _run_weight_loader_with_context(
     weight_loader,
     param,
@@ -91,6 +126,18 @@ def _run_weight_loader_with_context(
 
     if loader_kwargs is None:
         loader_kwargs = {}
+
+    # MLA inference keeps only the derived w_kc/w_vc tensors and releases the
+    # original kv_b_proj storage after each load.  Online RL updates send
+    # kv_b_proj again, so temporarily restore its destination storage before
+    # the regular loader copies the new tensor.  post_load_weights() derives
+    # fresh w_kc/w_vc and releases this temporary storage again.
+    if (
+        parameter_name.endswith(".kv_b_proj.weight")
+        and param.numel() > 0
+        and param.untyped_storage().nbytes() == 0
+    ):
+        param.data = torch.empty_like(param)
 
     try:
         return weight_loader(param, loaded_weight, *loader_args, **loader_kwargs)
@@ -209,6 +256,14 @@ class DeepseekV2WeightLoaderMixin:
             is_nextn: Whether loading NextN speculative decoding weights
         """
         nextn_conf = self._initialize_nextn_conf(is_nextn)
+
+        layer_index_map = getattr(self.config, "layer_index_map", None)
+        if (
+            not is_nextn
+            and layer_index_map is not None
+            and not getattr(self, "_checkpoint_layer_index_map_applied", False)
+        ):
+            weights = remap_checkpoint_layer_indices(weights, list(layer_index_map))
 
         weights = self._maybe_quant_weights_to_fp8_ue8m0(
             weights, NVFP4_CKPT_FP8_ATTN_QUANT_MODULES, nextn_conf
@@ -499,6 +554,10 @@ class DeepseekV2WeightLoaderMixin:
                 future.result()
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        if not is_nextn and layer_index_map is not None:
+            # Slime weight updates already use compact runtime layer names.
+            # Apply the source-checkpoint remap only during initial loading.
+            self._checkpoint_layer_index_map_applied = True
 
     def _initialize_nextn_conf(self, is_nextn: bool) -> NextNConfig:
         """
@@ -518,9 +577,13 @@ class DeepseekV2WeightLoaderMixin:
         assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
 
         # compatible with old design
-        nextn_layer_id = (
-            0 if self.config.num_hidden_layers == 1 else self.config.num_hidden_layers
-        )
+        nextn_layer_id = getattr(self.config, "nextn_source_layer", None)
+        if nextn_layer_id is None:
+            nextn_layer_id = (
+                0
+                if self.config.num_hidden_layers == 1
+                else self.config.num_hidden_layers
+            )
 
         return NextNEnabledConfig(
             num_nextn_layers=num_nextn_layers,
@@ -551,7 +614,24 @@ class DeepseekV2WeightLoaderMixin:
             weight_names: Optional list of loaded weight names to determine which layers to process
         """
         if is_nextn:
-            layer_ids = [self.config.num_hidden_layers]
+            nextn_layer_id = self.config.num_hidden_layers
+            if weight_names is None:
+                layer_ids = [nextn_layer_id]
+            else:
+                # Online RL updates are split into flattened buckets.  Most
+                # buckets contain only target-model layers, while the NextN
+                # runner has already freed kv_b_proj after deriving w_kc/w_vc.
+                # Rebuild those derived tensors only when this bucket actually
+                # carries the NextN kv_b_proj weight.
+                nextn_prefix = f"model.layers.{nextn_layer_id}."
+                layer_ids = (
+                    [nextn_layer_id]
+                    if any(
+                        name.startswith(nextn_prefix) and "kv_b_proj" in name
+                        for name in weight_names
+                    )
+                    else []
+                )
         else:
             if weight_names is None:
                 layer_ids = range(self.model.start_layer, self.model.end_layer)
