@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
@@ -184,6 +185,95 @@ def get_token_ids_logprobs(logprobs, token_ids_logprobs, no_copy_to_cpu=False):
     )
 
 
+def _top_p_filter_rows(
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_top_p_sampling: bool,
+    need_min_p_sampling: bool,
+    request_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return requested rows on which a sampling truncation is active."""
+    rows = top_ks != TOP_K_ALL
+    if need_top_p_sampling:
+        rows |= top_ps != 1.0
+    if need_min_p_sampling:
+        rows |= min_ps > 0
+    return request_mask & rows
+
+
+def _top_p_keep_mask_sorted(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_top_p_sampling: bool,
+    need_min_p_sampling: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rebuild the sampler's top-k/top-p/min-p support in probability order."""
+    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    ranks = torch.arange(probs_sort.shape[-1], device=probs.device).view(1, -1)
+    keep = ranks < top_ks.view(-1, 1)
+    if need_top_p_sampling:
+        keep &= (torch.cumsum(probs_sort, dim=-1) - probs_sort) <= top_ps.view(-1, 1)
+    if need_min_p_sampling:
+        keep &= probs_sort >= (probs_sort[:, 0] * min_ps).view(-1, 1)
+    return keep, probs_idx
+
+
+def renorm_logprob_over_top_p(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_top_p_sampling: bool,
+    need_min_p_sampling: bool,
+    request_mask: torch.Tensor,
+    force_keep_token_ids: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Renormalize requested rows over the replay support."""
+    rows = _top_p_filter_rows(
+        top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling, request_mask
+    )
+    if not bool(rows.any().item()):
+        return None
+    keep, probs_idx = _top_p_keep_mask_sorted(
+        probs, top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling
+    )
+    keep_vocab = torch.empty_like(keep)
+    keep_vocab.scatter_(-1, probs_idx, keep)
+    if force_keep_token_ids is not None:
+        row_idx = torch.arange(keep_vocab.shape[0], device=keep_vocab.device)
+        keep_vocab[row_idx, force_keep_token_ids.long()] = True
+    kept_probs = probs * keep_vocab
+    kept_probs /= kept_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    return torch.where(rows.view(-1, 1), torch.log(kept_probs), torch.log(probs))
+
+
+def get_top_p_token_ids_from_probs(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_top_p_sampling: bool,
+    need_min_p_sampling: bool,
+    request_mask: torch.Tensor,
+) -> Optional[List[Optional[torch.Tensor]]]:
+    """Return the exact sparse replay support for requested filtered rows."""
+    rows = _top_p_filter_rows(
+        top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling, request_mask
+    )
+    if not bool(rows.any().item()):
+        return None
+    keep, probs_idx = _top_p_keep_mask_sorted(
+        probs, top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling
+    )
+    return [
+        probs_idx[i][keep[i]].to(torch.int32) if bool(rows[i].item()) else None
+        for i in range(probs.shape[0])
+    ]
+
+
 def get_top_logprobs_chunk(
     logprobs: torch.Tensor,
     top_k_nums: List[int],
@@ -354,6 +444,7 @@ def compute_spec_v2_logprobs(
     predict: torch.Tensor,
     accept_index: torch.Tensor,
     speculative_num_steps: int,
+    accept_lens: Optional[torch.Tensor] = None,
 ):
     """Compute logprobs for accepted tokens after spec v2 verify sampling.
 
@@ -387,6 +478,73 @@ def compute_spec_v2_logprobs(
         accepted_token_ids.long(),
     ]
     logits_output.next_token_logprobs = token_logprobs.reshape(bs, max_accept)
+
+    if batch.sampling_info.need_return_top_p_token_ids:
+        if accept_lens is None:
+            accept_lens = torch.full(
+                (bs,), max_accept, dtype=torch.int32, device=device
+            )
+        valid = (
+            torch.arange(max_accept, device=device).view(1, -1)
+            < accept_lens.view(-1, 1)
+        ).reshape(-1)
+        request_mask = torch.repeat_interleave(
+            batch.sampling_info.return_top_p_token_ids, max_accept
+        ) & valid
+        if batch.sampling_info.is_all_greedy:
+            logits_output.next_token_top_p_token_ids = [
+                accepted_token_ids[i : i + 1].to(torch.int32)
+                if bool(request_mask[i].item())
+                else None
+                for i in range(bs * max_accept)
+            ]
+        else:
+            expanded_temperatures = torch.repeat_interleave(
+                batch.sampling_info.temperatures, max_accept, dim=0
+            )
+            probs = torch.softmax(gathered_logits / expanded_temperatures, dim=-1)
+            expanded_top_ks = torch.repeat_interleave(
+                batch.sampling_info.top_ks, max_accept
+            )
+            expanded_top_ps = torch.repeat_interleave(
+                batch.sampling_info.top_ps, max_accept
+            )
+            expanded_min_ps = torch.repeat_interleave(
+                batch.sampling_info.min_ps, max_accept
+            )
+            supports = get_top_p_token_ids_from_probs(
+                probs,
+                expanded_top_ks,
+                expanded_top_ps,
+                expanded_min_ps,
+                batch.sampling_info.need_top_p_sampling,
+                batch.sampling_info.need_min_p_sampling,
+                request_mask,
+            )
+            if supports is not None:
+                for i, support in enumerate(supports):
+                    if support is None:
+                        continue
+                    token = accepted_token_ids[i].to(torch.int32)
+                    if not bool((support == token).any().item()):
+                        supports[i] = torch.cat((support, token.view(1)))
+                logits_output.next_token_top_p_token_ids = supports
+
+            renormalized = renorm_logprob_over_top_p(
+                probs,
+                expanded_top_ks,
+                expanded_top_ps,
+                expanded_min_ps,
+                batch.sampling_info.need_top_p_sampling,
+                batch.sampling_info.need_min_p_sampling,
+                request_mask,
+                force_keep_token_ids=accepted_token_ids,
+            )
+            if renormalized is not None:
+                row_ids = torch.arange(bs * max_accept, device=device)
+                selected = renormalized[row_ids, accepted_token_ids.long()]
+                selected.clamp_(min=torch.finfo(selected.dtype).min)
+                logits_output.next_token_logprobs = selected.reshape(bs, max_accept)
 
     if batch.top_logprobs_nums and any(x > 0 for x in batch.top_logprobs_nums):
         top_logprobs_nums_expanded = [

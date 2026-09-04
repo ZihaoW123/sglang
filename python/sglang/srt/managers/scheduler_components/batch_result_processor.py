@@ -420,6 +420,11 @@ class SchedulerBatchResultProcessor:
                 logits_output.next_token_token_ids_logprobs_val = [
                     v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
                 ]
+            if logits_output.next_token_top_p_token_ids:
+                logits_output.next_token_top_p_token_ids = [
+                    v.tolist() if torch.is_tensor(v) else v
+                    for v in logits_output.next_token_top_p_token_ids
+                ]
 
     def _apply_prefill_logprobs(
         self,
@@ -951,6 +956,11 @@ class SchedulerBatchResultProcessor:
                 logits_output.next_token_token_ids_logprobs_val = [
                     v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
                 ]
+            if logits_output.next_token_top_p_token_ids:
+                logits_output.next_token_top_p_token_ids = [
+                    v.tolist() if torch.is_tensor(v) else v
+                    for v in logits_output.next_token_top_p_token_ids
+                ]
         return next_token_ids, next_token_logprobs
 
     def _apply_decode_logprobs(
@@ -977,8 +987,14 @@ class SchedulerBatchResultProcessor:
         for j, tok_id in enumerate(accepted_ids):
             req.logprob.output_token_logprobs_val.append(accepted_logprobs[j])
             req.logprob.output_token_logprobs_idx.append(tok_id)
+            flat_idx = i * max_accept + j
+            if logits_output.next_token_top_p_token_ids:
+                support = logits_output.next_token_top_p_token_ids[flat_idx]
+                if support is not None:
+                    if torch.is_tensor(support):
+                        support = support.tolist()
+                    req.logprob.output_top_p_token_ids.append(support)
             if req.logprob.top_logprobs_num > 0:
-                flat_idx = i * max_accept + j
                 req.logprob.output_top_logprobs_val.append(
                     logits_output.next_token_top_logprobs_val[flat_idx]
                 )
@@ -986,7 +1002,6 @@ class SchedulerBatchResultProcessor:
                     logits_output.next_token_top_logprobs_idx[flat_idx]
                 )
             if req.logprob.token_ids_logprob is not None:
-                flat_idx = i * max_accept + j
                 req.logprob.output_token_ids_logprobs_val.append(
                     logits_output.next_token_token_ids_logprobs_val[flat_idx]
                 )

@@ -411,10 +411,7 @@ class ModelRunner:
             torch.get_device_module(self.device)
         )
 
-        # CPU offload
-        set_offloader(
-            create_offloader_from_server_args(server_args, dp_rank=self.ps.dp_rank)
-        )
+        self.init_cpu_offloader(server_args)
 
         self._weight_checker = WeightChecker(get_model=lambda: self.model, ps=self.ps)
 
@@ -660,6 +657,14 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+
+    def init_cpu_offloader(self, server_args: ServerArgs):
+        # Target and EAGLE draft runners share a process-global offloader.
+        # A draft must not replace the target's offloader with its own instance.
+        if not self.is_draft_worker:
+            set_offloader(
+                create_offloader_from_server_args(server_args, dp_rank=self.ps.dp_rank)
+            )
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -1537,6 +1542,11 @@ class ModelRunner:
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
+        cuda_graph_num_tokens = None
+        if getattr(self.decode_cuda_graph_runner, "bs", None):
+            cuda_graph_num_tokens = self.decode_cuda_graph_runner.bs * getattr(
+                self.decode_cuda_graph_runner, "num_tokens_per_bs", 1
+            )
         if (
             not self.is_draft_worker
             and (experts_capturer := get_global_experts_capturer()) is not None
@@ -1544,7 +1554,7 @@ class ModelRunner:
             output.routed_experts_output = experts_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                cuda_graph_batch=cuda_graph_num_tokens,
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
@@ -1552,7 +1562,7 @@ class ModelRunner:
             output.indexer_topk_output = indexer_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                cuda_graph_batch=cuda_graph_num_tokens,
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 

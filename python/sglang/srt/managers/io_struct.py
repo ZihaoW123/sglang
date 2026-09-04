@@ -1361,6 +1361,7 @@ TopLogprobValues = Optional[List[Optional[List[Optional[List[float]]]]]]
 TopLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
 TokenIdsLogprobValues = Optional[List[Optional[List[Optional[List[float]]]]]]
 TokenIdsLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
+TopPTokenIds = Optional[List[Optional[List[Optional[List[int]]]]]]
 HiddenStateChunk = List[Optional[Union[float, List[float]]]]
 OutputHiddenStates = Optional[List[Optional[List[HiddenStateChunk]]]]
 CachedTokensDetails = Dict[str, Union[int, str]]
@@ -1434,6 +1435,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_token_ids_logprobs_idx: TokenIdsLogprobIndices
     output_token_ids_logprobs_val: TokenIdsLogprobValues
     output_token_ids_logprobs_idx: TokenIdsLogprobIndices
+    output_top_p_token_ids: TopPTokenIds
     output_token_entropy_val: Optional[List[Optional[float]]]
     # Per-request chunks of output-token sampling supports. None when no request
     # in the batch asks for return_sampling_mask.
@@ -1528,6 +1530,7 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_token_ids_logprobs_idx: TokenIdsLogprobIndices
     output_token_ids_logprobs_val: TokenIdsLogprobValues
     output_token_ids_logprobs_idx: TokenIdsLogprobIndices
+    output_top_p_token_ids: TopPTokenIds
     output_token_entropy_val: Optional[List[Optional[float]]]
     # Detokenizer pass-through for BatchTokenIDOutput.output_token_sampling_*.
     # None when sampling masks are not returned.
@@ -1959,6 +1962,29 @@ class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
 
 class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
     pass
+
+
+class PostProcessWeightsReqInput(BaseReq, kw_only=True):
+    restore_weights_before_load: bool = False
+    post_process_quantization: bool = False
+
+
+class PostProcessWeightsReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
+class PullWeightsReqInput(BaseReq, kw_only=True):
+    # Host-local checkpoint materialized from model_path on first use.
+    local_checkpoint_dir: str
+    # Publisher directory containing weight_v{N:06d} version directories.
+    source_dir: str
+    target_version: int
+
+
+class PullWeightsReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
 
 
 class CheckWeightsReqInput(BaseReq, kw_only=True):

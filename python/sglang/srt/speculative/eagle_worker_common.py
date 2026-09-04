@@ -625,7 +625,14 @@ def run_eagle_verify(
         bonus_tokens = torch.empty((0,), device=device, dtype=torch.int32)
 
     if batch.return_logprob and not batch.forward_mode.is_idle():
-        compute_spec_v2_logprobs(batch, logits_output, predict, accept_index, num_steps)
+        compute_spec_v2_logprobs(
+            batch,
+            logits_output,
+            predict,
+            accept_index,
+            num_steps,
+            accept_lens=accept_lens,
+        )
 
     if finalize_tree_path and not batch.forward_mode.is_idle() and topk > 1:
         # topk == 1 needs nothing here: the accepted path is already the front

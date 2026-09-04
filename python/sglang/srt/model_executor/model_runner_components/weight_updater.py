@@ -219,6 +219,35 @@ class WeightUpdater:
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
 
+    def post_process_weights(
+        self: WeightUpdater,
+        restore_weights_before_load: bool = False,
+        post_process_quantization: bool = False,
+    ) -> tuple[bool, str]:
+        """Run optional quantization hooks after an out-of-band weight update."""
+        from sglang.srt.model_loader.loader import device_loading_context
+
+        self._assert_weight_cache_inactive("post_process_weights")
+        target_device = torch.device(self.device)
+        try:
+            for module in self.get_model().modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is None:
+                    continue
+                with device_loading_context(module, target_device):
+                    if restore_weights_before_load and hasattr(
+                        quant_method, "restore_weights_before_loading"
+                    ):
+                        quant_method.restore_weights_before_loading(module)
+                    if post_process_quantization and hasattr(
+                        quant_method, "process_weights_after_loading"
+                    ):
+                        quant_method.process_weights_after_loading(module)
+        except Exception as exc:
+            logger.exception("Weight post-processing failed")
+            return False, str(exc)
+        return True, "Success."
+
     def update_weights_from_distributed(
         self: WeightUpdater,
         names,

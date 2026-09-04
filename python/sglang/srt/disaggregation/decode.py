@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -695,6 +696,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def release_memory_occupation(self):
         self.queue.clear()
         self.retracted_queue.clear()
+        self.pending_reqs.clear()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
 
@@ -784,6 +786,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
             )
 
+        bootstrap_timeout = float(
+            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
+        )
+        now = time.perf_counter()
         for decode_req, poll in zip(self.queue, polls):
             if poll is None:
                 continue
@@ -791,7 +797,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 continue
 
             if poll == KVPoll.Bootstrapping:
-                pass
+                entry_time = (
+                    decode_req.req.time_stats.decode_prealloc_queue_entry_time
+                )
+                if entry_time > 0 and now - entry_time > bootstrap_timeout:
+                    error_message = (
+                        f"Decode prealloc timed out after {now - entry_time:.1f}s "
+                        f"for rank={self.tp_rank}, rid={decode_req.req.rid}, "
+                        f"bootstrap_room={decode_req.req.bootstrap_room}"
+                    )
+                    logger.error(error_message)
+                    prepare_abort(
+                        decode_req.req,
+                        error_message,
+                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                    )
+                    if self.scheduler.metrics_reporter.enable_metrics:
+                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
                 decode_req.req.time_stats.set_bootstrap_done_time()
@@ -1867,6 +1889,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_token_logprobs_idx,
             output_top_logprobs_val,
             output_top_logprobs_idx,
+            output_top_p_token_ids_len,
+            output_top_p_token_ids,
             output_token_sampling_mask_len,
             output_token_sampling_mask_idx,
             output_token_sampling_logprobs,
@@ -1991,6 +2015,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     : decode_req.req.logprob.top_logprobs_num
                 ].tolist()
             )
+            top_p_len = int(output_top_p_token_ids_len[0].item())
+            if top_p_len > 0:
+                decode_req.req.logprob.output_top_p_token_ids.append(
+                    output_top_p_token_ids[:top_p_len].cpu().tolist()
+                )
         if decode_req.req.return_sampling_mask:
             assert (
                 output_token_sampling_mask_idx is not None
@@ -2063,6 +2092,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             polls = self._poll_with_staging()
         else:
             polls = self._poll_with_metadata_gate()
+
+        transfer_timeout = float(
+            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
+        )
+        now = time.perf_counter()
 
         transferred_reqs = []
         indices_to_remove = set()
@@ -2140,7 +2174,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 KVPoll.WaitingForInput,
                 KVPoll.Transferring,
             ]:
-                pass
+                entry_time = decode_req.req.time_stats.decode_transfer_queue_entry_time
+                if entry_time > 0 and now - entry_time > transfer_timeout:
+                    logger.error(
+                        "Decode transfer timeout for request rank=%s rid=%s room=%s "
+                        "after %ss",
+                        self.tp_rank,
+                        decode_req.req.rid,
+                        decode_req.req.bootstrap_room,
+                        transfer_timeout,
+                    )
+                    decode_req.kv_receiver.abort()
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
@@ -2166,6 +2210,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
+        for decode_req in self.queue:
+            if decode_req.kv_receiver is not None:
+                decode_req.kv_receiver.abort()
         self.queue.clear()
 
     def resume_memory_occupation(self):
@@ -2408,6 +2455,11 @@ class SchedulerDisaggregationDecodeMixin:
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
+            transferred_reqs = self.disagg_decode_transfer_queue.pop_transferred()
+            if self.enable_hisparse:
+                for req in transferred_reqs:
+                    self.hisparse_coordinator.admit_request_direct(req)
+            self.waiting_queue.extend(transferred_reqs)
             # if there are still retracted requests, we do not allocate new requests
             return
 

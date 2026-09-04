@@ -177,7 +177,7 @@ class QueueMetrics(msgspec.Struct, array_like=True):
 # LoadSnapshot's nested sub-struct fields; every other struct field is a flat
 # scalar returned under "core".
 _SECTION_FIELDS = frozenset(
-    {"memory", "speculative", "lora", "disaggregation", "queues"}
+    {"memory", "speculative", "lora", "disaggregation", "queues", "inflight"}
 )
 
 
@@ -211,9 +211,19 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     lora: Optional[LoRAMetrics] = None
     disaggregation: Optional[DisaggregationMetrics] = None
     queues: Optional[QueueMetrics] = None
+    inflight: Optional[list[dict]] = None
 
     VALID_SECTIONS = frozenset(
-        {"core", "memory", "spec", "lora", "disagg", "queues", "all"}
+        {
+            "core",
+            "memory",
+            "spec",
+            "lora",
+            "disagg",
+            "queues",
+            "inflight",
+            "all",
+        }
     )
 
     def to_dict(self, include: Optional[set[str]] = None) -> dict:
@@ -241,6 +251,9 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
             if section is None or (not include_all and include_name not in include):
                 continue
             load[field] = msgspec.structs.asdict(section)
+
+        if self.inflight is not None and (include_all or "inflight" in include):
+            load["inflight"] = self.inflight
 
         return load
 

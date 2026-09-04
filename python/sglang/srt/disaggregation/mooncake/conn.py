@@ -1140,7 +1140,7 @@ class MooncakeKVManager(CommonKVManager):
         for i, dst_aux_ptr in enumerate(dst_aux_ptrs):
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
-            dst_addr = dst_aux_ptrs[i] + length * req.dst_aux_index
+            dst_addr = dst_aux_ptr + length * req.dst_aux_index
             transfer_blocks.append((src_addr, dst_addr, length))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
@@ -1826,12 +1826,6 @@ class MooncakeKVManager(CommonKVManager):
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
-                                if self.session_failures[req.mooncake_session_id] >= 1:
-                                    self.failed_sessions.add(req.mooncake_session_id)
-                                    logger.error(
-                                        f"Session {req.mooncake_session_id} failed."
-                                    )
                             self.record_failure(
                                 kv_chunk.room,
                                 f"Failed to send kv chunk of {kv_chunk.room} to "

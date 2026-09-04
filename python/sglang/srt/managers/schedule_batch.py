@@ -795,6 +795,7 @@ class ReqLogprob:
         None
     )
     output_token_ids_logprobs_idx: Optional[list] = None
+    output_top_p_token_ids: Optional[list] = None
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
@@ -1074,6 +1075,7 @@ class Req(ReqDllmMixin):
             # Can contain either lists or GPU tensors (delayed copy optimization for prefill-only scoring)
             self.logprob.output_token_ids_logprobs_val = []
             self.logprob.output_token_ids_logprobs_idx = []
+            self.logprob.output_top_p_token_ids = []
         if return_sampling_mask:
             self.output_token_sampling_mask = []
             self.output_token_sampling_logprobs = []
@@ -1147,6 +1149,7 @@ class Req(ReqDllmMixin):
         self.metrics_collector = metrics_collector
         if time_stats is not None:
             self.time_stats = SchedulerReqTimeStats.new_from_obj(time_stats)
+            self.time_stats.disagg_mode = disagg_mode
         else:
             self.time_stats = SchedulerReqTimeStats(disagg_mode=disagg_mode)
         self.time_stats.set_metrics_collector(metrics_collector)
@@ -2819,11 +2822,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         retracted_reqs = []
         first_iter = True
+        num_minimum_reqs = (
+            0 if server_args.disaggregation_mode == "decode" else 1
+        )
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
         ):
-            if len(sorted_indices) == 1:
-                # Always keep at least one request
+            if len(sorted_indices) <= num_minimum_reqs:
+                # Unified mode keeps one request; decode disaggregation may retract all.
                 break
 
             first_iter = False
@@ -2834,7 +2840,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.release_req(idx, len(sorted_indices), server_args)
 
         reqs_to_abort: List[Req] = []
-        if len(sorted_indices) <= 1 and not self.check_decode_mem(
+        if len(sorted_indices) <= num_minimum_reqs and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
             # Even the last remaining request cannot fit in memory.

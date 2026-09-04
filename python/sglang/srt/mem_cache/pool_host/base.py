@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import abc
+import ctypes
+import ctypes.util
+import gc
 import logging
 import threading
 from functools import wraps
@@ -23,6 +26,27 @@ _is_hip = is_hip()
 
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
+
+try:
+    _libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
+    _libc.malloc_trim.argtypes = [ctypes.c_size_t]
+    _libc.malloc_trim.restype = ctypes.c_int
+except (AttributeError, OSError):
+    _libc = None
+
+
+def _iter_tensors(value):
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_tensors(item)
+
+
+def _trim_host_allocator() -> None:
+    gc.collect()
+    if _libc is not None:
+        _libc.malloc_trim(0)
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
 
@@ -138,9 +162,21 @@ class HostKVCache(abc.ABC):
                 device_pool.size,
             )
 
-        # Verify there is enough available host memory.
+        self._check_host_memory_available()
+
+        self.lock = threading.RLock()
+        self._host_memory_released = False
+        self._init_host_buffers()
+
+        # A lock for synchronized operations on memory allocation and state transitions.
+        self.clear()
+
+    def _requested_host_memory_bytes(self) -> int:
+        return self.size * self.size_per_token
+
+    def _check_host_memory_available(self) -> None:
         host_mem = psutil.virtual_memory()
-        requested_bytes = self.size * self.size_per_token
+        requested_bytes = self._requested_host_memory_bytes()
         available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
         if requested_bytes > available_bytes:
             raise ValueError(
@@ -149,33 +185,76 @@ class HostKVCache(abc.ABC):
                 f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
                 f"size of the hierarchical cache."
             )
-        else:
-            draft_layer_num = self.layer_num - self.target_layer_num
-            if draft_layer_num > 0:
-                logger.info(
-                    "Allocating %s hierarchical KV host pool: %d tokens, "
-                    "%.2f GB host memory, packed MTP KV layers: "
-                    "target_layers=%d, draft_layers=%d, total_layers=%d.",
-                    pool_label,
-                    self.size,
-                    requested_bytes / 1e9,
-                    self.target_layer_num,
-                    draft_layer_num,
-                    self.layer_num,
-                )
-            else:
-                logger.info(
-                    "Allocating %s hierarchical KV host pool: %d tokens, %.2f GB host memory.",
-                    pool_label,
-                    self.size,
-                    requested_bytes / 1e9,
-                )
+        logger.info(
+            "Allocating %s hierarchical KV host pool: %d tokens, %.2f GB host memory.",
+            self.pool_label,
+            self.size,
+            requested_bytes / 1e9,
+        )
 
+    def _init_host_buffers(self) -> None:
         self.kv_buffer = self.init_kv_buffer()
         self.fd = getattr(self.allocator, "fd", None)
 
-        # A lock for synchronized operations on memory allocation and state transitions.
-        self.lock = threading.RLock()
+    def _post_init_host_buffers(self) -> None:
+        """Rebuild derived views/pointers after host buffers are reallocated."""
+
+    def _host_buffer_attr_names(self):
+        return ("kv_buffer",)
+
+    def _host_derived_attr_names(self):
+        return (
+            "k_data_refs",
+            "v_data_refs",
+            "k_data_ptrs",
+            "v_data_ptrs",
+            "host_kv_data_refs",
+            "data_refs",
+            "data_ptrs",
+            "index_k_data_refs",
+            "index_k_data_ptrs",
+        )
+
+    def _release_host_buffers(self) -> None:
+        seen_ptrs = set()
+        for attr in self._host_derived_attr_names():
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        for attr in self._host_buffer_attr_names():
+            value = getattr(self, attr, None)
+            if value is not None and self.pin_memory and (_is_cuda or _is_hip):
+                for tensor in _iter_tensors(value):
+                    ptr = tensor.data_ptr()
+                    if ptr and ptr not in seen_ptrs:
+                        seen_ptrs.add(ptr)
+                        _cuda_host_unregister(tensor)
+            setattr(self, attr, None)
+
+    @synchronized
+    def release_memory_occupation(self) -> None:
+        if not hasattr(self, "_host_memory_released") or self._host_memory_released:
+            return
+        self._release_host_buffers()
+        self.mem_state = torch.empty((0,), dtype=torch.uint8, device=self.device)
+        self.free_slots = torch.empty((0,), dtype=torch.int64)
+        self.slot_used = torch.empty((0,), dtype=torch.bool)
+        self.release_slots = []
+        self.num_release_slots = 0
+        self._host_memory_released = True
+        _trim_host_allocator()
+        logger.info(
+            "Released %.2f GB host memory for hierarchical cache.",
+            self._requested_host_memory_bytes() / 1e9,
+        )
+
+    @synchronized
+    def resume_memory_occupation(self) -> None:
+        if not hasattr(self, "_host_memory_released") or not self._host_memory_released:
+            return
+        self._check_host_memory_available()
+        self._init_host_buffers()
+        self._post_init_host_buffers()
+        self._host_memory_released = False
         self.clear()
 
     def destroy(self):
@@ -189,14 +268,7 @@ class HostKVCache(abc.ABC):
         if getattr(self, "_destroyed", False):
             return
         self._destroyed = True
-        buffers = getattr(self, "kv_buffer", None)
-        if buffers is not None and self.pin_memory and (_is_cuda or _is_hip):
-            if not isinstance(buffers, (list, tuple)):
-                buffers = [buffers]
-            for buf in buffers:
-                if buf is not None:
-                    _cuda_host_unregister(buf)
-        self.kv_buffer = None
+        self._release_host_buffers()
 
     @abc.abstractmethod
     def get_size_per_token(self):

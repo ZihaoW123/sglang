@@ -140,6 +140,30 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             ]
         self._init_write_back_staging_buffers()
 
+    def _host_buffer_attr_names(self):
+        return (
+            "kv_buffer",
+            "k_buffer",
+            "v_buffer",
+            "index_k_buffer",
+            "index_k_scale_buffer",
+        )
+
+    def _post_init_host_buffers(self) -> None:
+        if self.layout == "page_first":
+            transposed = self.kv_buffer.transpose(0, 1)
+            self.data_refs = [transposed[i] for i in range(self.layer_num)]
+        elif self.layout in ("layer_first", "page_first_direct"):
+            self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+        else:
+            self.data_refs = []
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+        self._init_write_back_staging_buffers()
+
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
         for registering host memory with the disaggregation transfer engine."""

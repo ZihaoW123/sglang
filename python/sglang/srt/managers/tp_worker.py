@@ -30,6 +30,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    PostProcessWeightsReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
@@ -217,6 +218,12 @@ class BaseTpWorker(ABC):
             recv_req
         )
         return success, message
+
+    def post_process_weights(self, recv_req: PostProcessWeightsReqInput):
+        return self.model_runner.weight_updater.post_process_weights(
+            restore_weights_before_load=recv_req.restore_weights_before_load,
+            post_process_quantization=recv_req.post_process_quantization,
+        )
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.model_runner.weight_exporter.get_weights_by_name(

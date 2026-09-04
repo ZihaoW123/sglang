@@ -518,6 +518,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         token_ids = req.get_fill_ids()
+        kv_committed_len = getattr(req, "kv_committed_len", None)
+        if kv_committed_len is not None and len(token_ids) > kv_committed_len:
+            token_ids = token_ids[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
@@ -649,9 +652,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             node.lock_ref -= 1
             self._update_leaf_status(node)
             if node.parent is None:
-                assert (
-                    node is self.root_node
-                ), "This request holds the node from another tree"
+                break
             node = node.parent
         return DecLockRefResult(delta=delta)
 

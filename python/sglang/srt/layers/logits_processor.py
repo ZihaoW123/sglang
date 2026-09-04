@@ -125,6 +125,8 @@ class LogitsProcessorOutput:
     # truncation/renormalization. Only populated when requested.
     next_token_sampling_mask_idx: Optional[List[Optional[List[int]]]] = None
     next_token_sampling_logprobs: Optional[List[Optional[float]]] = None
+    # Legacy Slime top-p replay wire format. One support row per sampled token.
+    next_token_top_p_token_ids: Optional[List[Optional[torch.Tensor]]] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logprobs of input tokens.        shape: [#token]

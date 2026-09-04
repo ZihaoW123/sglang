@@ -2726,6 +2726,11 @@ class ServerArgs:
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
         NS("memory"),
     ] = None
+    release_hicache: A[
+        bool,
+        "Release hierarchical-cache host memory while the KV-cache memory region is released.",
+        NS("memory"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
@@ -3189,6 +3194,11 @@ class ServerArgs:
             help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
             nargs="*",
         ),
+        NS("model"),
+    ] = None
+    custom_pull_weights_pre_read_hook: A[
+        Optional[str],
+        "Import path of a hook(source_dir, target_version) invoked before /pull_weights reads a published version.",
         NS("model"),
     ] = None
     weight_loader_disable_mmap: A[

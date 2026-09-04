@@ -324,6 +324,7 @@ class _GenerationStreamAccumulator:
     input_token_ids_logprobs_idx: Optional[list] = None
     output_token_ids_logprobs_val: Optional[list] = None
     output_token_ids_logprobs_idx: Optional[list] = None
+    output_top_p_token_ids: Optional[list] = None
     output_token_sampling_mask: Optional[list] = None
     output_token_sampling_logprobs: Optional[list] = None
     # Rust server mode: the Rust detokenizer reconstructs text/ids from the raw
@@ -355,6 +356,7 @@ class _GenerationStreamAccumulator:
             self.input_token_ids_logprobs_idx = []
             self.output_token_ids_logprobs_val = []
             self.output_token_ids_logprobs_idx = []
+            self.output_top_p_token_ids = []
         if self.return_sampling_mask:
             self.output_token_sampling_mask = []
             self.output_token_sampling_logprobs = []
@@ -534,6 +536,11 @@ class _GenerationStreamAccumulator:
                         send_output_token_logprobs_offset:logprob_end
                     ]
                 )
+                self.output_top_p_token_ids.append(
+                    req.logprob.output_top_p_token_ids[
+                        send_output_token_logprobs_offset:logprob_end
+                    ]
+                )
                 req.send_output_token_logprobs_offset = logprob_end
             else:
                 self.output_token_logprobs_val.append([])
@@ -542,6 +549,7 @@ class _GenerationStreamAccumulator:
                 self.output_top_logprobs_idx.append([])
                 self.output_token_ids_logprobs_val.append([])
                 self.output_token_ids_logprobs_idx.append([])
+                self.output_top_p_token_ids.append([])
 
         if self.return_sampling_mask:
             if req.return_sampling_mask:
@@ -667,6 +675,7 @@ class _GenerationStreamAccumulator:
             input_token_ids_logprobs_idx=self.input_token_ids_logprobs_idx,
             output_token_ids_logprobs_val=self.output_token_ids_logprobs_val,
             output_token_ids_logprobs_idx=self.output_token_ids_logprobs_idx,
+            output_top_p_token_ids=self.output_top_p_token_ids,
             output_token_entropy_val=None,
             output_token_sampling_mask=self.output_token_sampling_mask,
             output_token_sampling_logprobs=self.output_token_sampling_logprobs,

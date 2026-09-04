@@ -488,6 +488,7 @@ class NGRAMWorker(BaseSpecWorker):
                     predict,
                     accept_index,
                     self.draft_token_num - 1,
+                    accept_lens=accept_lens,
                 )
 
             if on_publish is not None:

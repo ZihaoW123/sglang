@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from itertools import islice
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
@@ -28,6 +29,11 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# Load snapshots use a fixed 16 KiB shared-memory slot. Keep diagnostics useful
+# without allowing a large request queue to break periodic load publication.
+MAX_INFLIGHT_REQS_PER_SNAPSHOT = 32
+MAX_INFLIGHT_ID_CHARS = 128
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -205,6 +211,90 @@ class SchedulerLoadInquirer:
         totals = self.get_decode_moment_totals()
         decode_moments = list(totals) if totals[0] > 0 else None
 
+        now_perf = time.perf_counter()
+        inflight_queues = [("running", self.get_running_batch().reqs, None)]
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            inflight_queues.extend(
+                [
+                    ("waiting", self.get_waiting_queue(), "wait_queue_entry_time"),
+                    (
+                        "bootstrap",
+                        self.get_disagg_prefill_bootstrap_queue().queue,
+                        "prefill_bootstrap_queue_entry_time",
+                    ),
+                    (
+                        "prefill_inflight",
+                        self.get_disagg_prefill_inflight_queue(),
+                        "prefill_transfer_queue_entry_time",
+                    ),
+                ]
+            )
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            prealloc = self.get_disagg_decode_prealloc_queue()
+            inflight_queues.extend(
+                [
+                    ("waiting", self.get_waiting_queue(), "wait_queue_entry_time"),
+                    ("prealloc", prealloc.queue, "decode_prealloc_queue_entry_time"),
+                    (
+                        "transfer",
+                        self.get_disagg_decode_transfer_queue().queue,
+                        "decode_transfer_queue_entry_time",
+                    ),
+                    (
+                        "retracted",
+                        prealloc.retracted_queue,
+                        "decode_prealloc_queue_entry_time",
+                    ),
+                ]
+            )
+        else:
+            inflight_queues.append(
+                ("waiting", self.get_waiting_queue(), "wait_queue_entry_time")
+            )
+
+        def bounded_id(value):
+            if value is None:
+                return None
+            return str(value)[:MAX_INFLIGHT_ID_CHARS]
+
+        def describe(entry, stage, entry_time_field):
+            req = getattr(entry, "req", entry)
+            item = {
+                "rid": bounded_id(getattr(req, "rid", None)),
+                "bootstrap_room": bounded_id(getattr(req, "bootstrap_room", None)),
+                "seqlen": getattr(entry, "seqlen", getattr(req, "seqlen", None)),
+                "stage": stage,
+            }
+            if entry_time_field is not None:
+                stats = getattr(req, "time_stats", None)
+                entry_time = getattr(stats, entry_time_field, 0.0) if stats else 0.0
+                item["age_s"] = (
+                    round(now_perf - entry_time, 3) if entry_time else None
+                )
+            if entry is not req:
+                item["waiting_for_input"] = getattr(
+                    entry, "waiting_for_input", None
+                )
+                item["timeout_cancel_issued"] = getattr(
+                    entry, "timeout_cancel_issued", None
+                )
+            return item
+
+        inflight = []
+        remaining = MAX_INFLIGHT_REQS_PER_SNAPSHOT
+        for name, queue, field in inflight_queues:
+            num_reqs = len(queue)
+            sample = list(islice(iter(queue), remaining))
+            remaining -= len(sample)
+            inflight.append(
+                {
+                    "name": name,
+                    "num_reqs": num_reqs,
+                    "reqs": [describe(entry, name, field) for entry in sample],
+                    "truncated": max(0, num_reqs - len(sample)),
+                }
+            )
+
         return LoadSnapshot(
             dp_rank=int(self.ps.dp_rank) if self.ps.dp_rank is not None else 0,
             timestamp=time.time(),
@@ -228,4 +318,5 @@ class SchedulerLoadInquirer:
             total_prefill_uncached_tokens=self.get_total_prefill_uncached_tokens(),
             total_prefill_busy_us=self.get_total_prefill_busy_us(),
             decode_moments=decode_moments,
+            inflight=inflight,
         )

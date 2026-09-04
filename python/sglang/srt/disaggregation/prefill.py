@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import time
 from array import array
 from collections import deque
 from http import HTTPStatus
@@ -437,6 +439,10 @@ class PrefillBootstrapQueue:
                 self.scheduler.attn_tp_cpu_group,
             )
 
+        bootstrap_timeout = float(
+            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
+        )
+        now = time.perf_counter()
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
             if poll is None:
                 continue
@@ -446,6 +452,30 @@ class PrefillBootstrapQueue:
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
+                entry_time = req.time_stats.prefill_bootstrap_queue_entry_time
+                if entry_time > 0 and now - entry_time > bootstrap_timeout:
+                    error_message = (
+                        f"Prefill bootstrap timed out after {now - entry_time:.1f}s "
+                        f"for rank={self.tp_rank}, rid={req.rid}, "
+                        f"bootstrap_room={req.bootstrap_room}"
+                    )
+                    logger.error(error_message)
+                    req.time_stats.trace_ctx.abort(
+                        abort_info={"reason": error_message}
+                    )
+                    prepare_abort(
+                        req, error_message, status_code=HTTPStatus.GATEWAY_TIMEOUT
+                    )
+                    if hasattr(req.disagg_kv_sender, "clear"):
+                        req.disagg_kv_sender.clear()
+                    self.scheduler.output_streamer.stream_output(
+                        [req], req.return_logprob
+                    )
+                    indices_to_remove.add(i)
+                    failed_reqs.append(req)
+                    if self.scheduler.metrics_reporter.enable_metrics:
+                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+                    continue
                 if (
                     req.prefill_attempt_count
                     < self.scheduler.server_args.optimistic_prefill_attempts
@@ -454,6 +484,7 @@ class PrefillBootstrapQueue:
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
                     req.prefill_attempt_count += 1
+                    req.time_stats.prefill_retry_count = req.prefill_attempt_count
                     bootstrapped_reqs.append(req)
                     indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
@@ -462,6 +493,7 @@ class PrefillBootstrapQueue:
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
                     req.prefill_attempt_count += 1
+                    req.time_stats.prefill_retry_count = req.prefill_attempt_count
                 elif not self.finalize_bootstrap(req):
                     continue
                 bootstrapped_reqs.append(req)
@@ -874,6 +906,11 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_tp_cpu_group,
         )
 
+        transfer_timeout = float(
+            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
+        )
+        now = time.perf_counter()
+
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
@@ -915,8 +952,26 @@ class SchedulerDisaggregationPrefillMixin:
                 continue
 
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
-                # todo: set Transferring correctly in backend
-                undone_reqs.append(req)
+                entry_time = req.time_stats.prefill_transfer_queue_entry_time
+                if entry_time > 0 and now - entry_time > transfer_timeout:
+                    error_message = (
+                        f"Prefill transfer timed out after {now - entry_time:.1f}s "
+                        f"(state={poll}) for rank={self.ps.tp_rank}, rid={req.rid}, "
+                        f"bootstrap_room={req.bootstrap_room}"
+                    )
+                    logger.error(error_message)
+                    release_kv_cache(req, self.tree_cache)
+                    prepare_abort(
+                        req, error_message, status_code=HTTPStatus.GATEWAY_TIMEOUT
+                    )
+                    if hasattr(req.disagg_kv_sender, "clear"):
+                        req.disagg_kv_sender.clear()
+                    done_reqs.append(req)
+                    if self.metrics_reporter.enable_metrics:
+                        self.metrics_collector.increment_transfer_failed_reqs()
+                else:
+                    # todo: set Transferring correctly in backend
+                    undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
@@ -1450,6 +1505,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.disagg_prefill_bootstrap_queue.queue.append(req)
         else:
             req.prefill_attempt_count += 1
+            req.time_stats.prefill_retry_count = req.prefill_attempt_count
             logger.info(
                 f"Req {req.rid} optimistic prefill yielded "
                 f"({req.prefill_attempt_count}/{max_attempts} attempts used)"

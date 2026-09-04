@@ -77,6 +77,10 @@ class SamplingBatchInfo:
     return_sampling_masks: Optional[List[bool]] = None
     sampling_mask_max_top_k: int = 0
 
+    # Backward-compatible Slime request carried in sampling_params.custom_params.
+    return_top_p_token_ids: Optional[torch.Tensor] = None
+    need_return_top_p_token_ids: bool = False
+
     # Device
     device: str = "cuda"
 
@@ -114,6 +118,16 @@ class SamplingBatchInfo:
             dtype=torch.float,
             pin_memory=_pin,
         ).to(device, non_blocking=True)
+        return_top_p_token_ids_cpu = [
+            bool(
+                isinstance(r.sampling_params.custom_params, dict)
+                and r.sampling_params.custom_params.get("return_top_p_token_ids", False)
+            )
+            for r in reqs
+        ]
+        return_top_p_token_ids = torch.tensor(
+            return_top_p_token_ids_cpu, dtype=torch.bool, device=device
+        )
         sampling_seed = (
             torch.tensor(
                 [
@@ -206,6 +220,8 @@ class SamplingBatchInfo:
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
             need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
+            return_top_p_token_ids=return_top_p_token_ids,
+            need_return_top_p_token_ids=any(return_top_p_token_ids_cpu),
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
@@ -310,6 +326,7 @@ class SamplingBatchInfo:
             "top_ps",
             "top_ks",
             "min_ps",
+            "return_top_p_token_ids",
             "sampling_seed",
         ]:
             value = getattr(self, item, None)
@@ -435,6 +452,7 @@ class SamplingBatchInfo:
             "top_ps",
             "top_ks",
             "min_ps",
+            "return_top_p_token_ids",
             "sampling_seed",
         ]:
             self_val = getattr(self, item, None)
@@ -447,6 +465,7 @@ class SamplingBatchInfo:
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
+        self.need_return_top_p_token_ids |= other.need_return_top_p_token_ids
 
         self.adjusted_merge_batch(other)
 

@@ -147,6 +147,28 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.host_kv_data_refs = self.k_data_refs + self.v_data_refs
         self._init_write_back_staging_buffers()
 
+    def _post_init_host_buffers(self) -> None:
+        if self.layout == "page_first":
+            k_transposed = self.k_buffer.transpose(0, 1)
+            v_transposed = self.v_buffer.transpose(0, 1)
+            self.k_data_refs = [k_transposed[i] for i in range(self.layer_num)]
+            self.v_data_refs = [v_transposed[i] for i in range(self.layer_num)]
+        else:
+            self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
+            self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+        self.host_kv_data_refs = self.k_data_refs + self.v_data_refs
+        self._init_write_back_staging_buffers()
+
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim
@@ -733,6 +755,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         allocator_type: str = "default",
     ):
         self.device_pool = device_pool
+        self.pool_label = "index_k"
         self.page_size = anchor_host.page_size
         self.layout = layout
         self.pin_memory = pin_memory
@@ -770,6 +793,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
 
         self.init_kv_buffer()
         self.lock = threading.RLock()
+        self._host_memory_released = False
         self.clear()
 
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
@@ -780,6 +804,26 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+        if self.layout == "page_first":
+            transposed = self.k_buffer.transpose(0, 1)
+            self.k_data_refs = [transposed[i] for i in range(self.layer_num)]
+        elif self.layout == "layer_first":
+            self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
+        else:
+            self.k_data_refs = []
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
+    def _host_buffer_attr_names(self):
+        return ("k_buffer",)
+
+    def _init_host_buffers(self) -> None:
+        self.init_kv_buffer()
+
+    def _post_init_host_buffers(self) -> None:
         if self.layout == "page_first":
             transposed = self.k_buffer.transpose(0, 1)
             self.k_data_refs = [transposed[i] for i in range(self.layer_num)]

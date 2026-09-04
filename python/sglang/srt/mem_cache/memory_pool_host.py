@@ -82,6 +82,7 @@ class MambaPoolHost(HostKVCache):
         layout: str = "layer_first",
     ):
         self.device_pool = device_pool
+        self.pool_label = "mamba"
         self.page_size = 1
 
         assert layout in [
@@ -173,7 +174,30 @@ class MambaPoolHost(HostKVCache):
         self.init_kv_buffer()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
+        self._host_memory_released = False
         self.clear()
+
+    def _requested_host_memory_bytes(self) -> int:
+        return self.size * self.size_per_token
+
+    def _check_host_memory_available(self) -> None:
+        host_mem = psutil.virtual_memory()
+        available = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        requested = self._requested_host_memory_bytes()
+        if requested > available:
+            raise ValueError(
+                f"Not enough host memory available. Requesting {requested / 1e9:.2f} "
+                f"GB but only have {available / 1e9:.2f} GB free."
+            )
+
+    def _host_buffer_attr_names(self):
+        return ("temporal_buffer", "conv_buffer")
+
+    def _init_host_buffers(self) -> None:
+        self.init_kv_buffer()
+
+    def _post_init_host_buffers(self) -> None:
+        self._init_write_back_staging_buffers()
 
     def init_kv_buffer(self):
         _host_alloc = ALLOC_MEMORY_FUNCS[self.device_pool.device]
@@ -356,22 +380,12 @@ class MambaPoolHost(HostKVCache):
                 page_size=1,
             )
         elif io_backend == "kernel_ascend":
-            if transfer_mamba_state is not None:
-                # NPU: use dedicated transfer_mamba_state kernel (aclrtMemcpy2dAsync)
-                transfer_mamba_state(
-                    device_buf=src_layers,
-                    host_buf=dst,
-                    device_indices=src_indices,
-                    host_indices=dst_indices,
-                    direction=TransferDirection.D2H,
-                )
-            else:
-                # Fallback: per-layer torch indexing when kernel is not available
-                for layer_id in range(num_layers):
-                    src_layer = src_layers[layer_id]
-                    dst[dst_indices.to(dst.device), layer_id, 0] = src_layer[
-                        src_indices.to(src_layer.device)
-                    ].to(dst.device)
+            # This helper transfers one layer at a time.  The dedicated Ascend
+            # kernel handles the all-layer page-first layout in the methods
+            # below; use indexed assignment for this layer-first fallback.
+            dst[dst_indices.to(dst.device)] = src[src_indices.to(src.device)].to(
+                dst.device
+            )
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -835,6 +849,12 @@ class LogicalHostPool:
 
     def get_ksize_per_token(self):
         return 0
+
+    def release_memory_occupation(self) -> None:
+        pass
+
+    def resume_memory_occupation(self) -> None:
+        pass
 
 
 class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
@@ -1743,6 +1763,18 @@ class HostPoolGroup:
         for entry in self.entries:
             entry.host_pool.destroy()
 
+    def release_memory_occupation(self) -> None:
+        for entry in self.entries:
+            release = getattr(entry.host_pool, "release_memory_occupation", None)
+            if release is not None:
+                release()
+
+    def resume_memory_occupation(self) -> None:
+        for entry in self.entries:
+            resume = getattr(entry.host_pool, "resume_memory_occupation", None)
+            if resume is not None:
+                resume()
+
     def available_size(self):
         return self.anchor_entry.host_pool.available_size()
 
@@ -1891,6 +1923,7 @@ class DSAIndexerPoolHost(HostKVCache):
         allocator_type: str = "default",
     ):
         self.device_pool = device_pool
+        self.pool_label = "dsa_indexer"
         self.page_size = anchor_host.page_size
         self.layout = layout
         self.pin_memory = pin_memory
@@ -1955,7 +1988,25 @@ class DSAIndexerPoolHost(HostKVCache):
         self.can_use_write_back_jit = False
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
+        self._host_memory_released = False
         self.clear()
+
+    def _requested_host_memory_bytes(self) -> int:
+        return (
+            self.page_num
+            * self.layer_num
+            * self.indexer_page_stride_size
+            * self.indexer_dtype.itemsize
+        )
+
+    def _host_buffer_attr_names(self):
+        return ("index_k_with_scale_buffer",)
+
+    def _init_host_buffers(self) -> None:
+        self.init_kv_buffer()
+
+    def _post_init_host_buffers(self) -> None:
+        self._init_write_back_staging_buffers()
 
     def get_size_per_token(self):
         return (

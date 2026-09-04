@@ -1906,6 +1906,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens.reshape(-1),
                 output_indices,
                 block_size - 1,
+                accept_lens=commit_lens,
             )
 
         if self._need_mamba_verify_commit:

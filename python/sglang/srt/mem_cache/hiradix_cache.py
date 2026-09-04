@@ -787,6 +787,18 @@ class HiRadixCache(RadixCache):
         self.evictable_host_leaves.clear()
         super().reset()
 
+    def release_memory_occupation(self) -> None:
+        if self.enable_storage:
+            logger.warning(
+                "Skipping HiCache host-memory release while a storage backend is enabled."
+            )
+            return
+        self.cache_controller.mem_pool_host.release_memory_occupation()
+
+    def resume_memory_occupation(self) -> None:
+        if not self.enable_storage:
+            self.cache_controller.mem_pool_host.resume_memory_occupation()
+
     def release_host_resources(self) -> None:
         if self.token_to_kv_pool_host is not None:
             self.token_to_kv_pool_host.destroy()
@@ -1183,9 +1195,7 @@ class HiRadixCache(RadixCache):
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
             if node.parent is None:
-                assert (
-                    node is self.root_node
-                ), f"This request holds the node from another tree"
+                break
             node = node.parent
         return DecLockRefResult(delta=delta)
 
@@ -1291,6 +1301,7 @@ class HiRadixCache(RadixCache):
         self._update_host_leaf_status(node)
         # update leaf status for the parent because the node is evicted
         self._update_leaf_status(node.parent)
+        self._update_host_leaf_status(node.parent)
         return num_evicted
 
     def _evict_backuped(self, node: TreeNode):

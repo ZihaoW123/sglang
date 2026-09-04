@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import random
 from collections import deque
@@ -25,6 +26,8 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, is_npu
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
     from sglang.srt.disaggregation.common.conn import (
@@ -46,6 +49,7 @@ if is_npu():
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
+MAX_PD_TOP_P_TOKEN_IDS = 4096
 
 
 def poll_and_all_reduce_pp(
@@ -365,6 +369,12 @@ class MetadataBuffers:
             self.output_top_logprobs_idx = torch.zeros(
                 (size, max_top_logprobs_num), dtype=torch.int32, device=device
             )
+            self.output_top_p_token_ids_len = torch.zeros(
+                (size, 16), dtype=torch.int32, device=device
+            )
+            self.output_top_p_token_ids = torch.zeros(
+                (size, MAX_PD_TOP_P_TOKEN_IDS), dtype=torch.int32, device=device
+            )
             self.output_token_sampling_mask_len = None
             self.output_token_sampling_mask_idx = None
             self.output_token_sampling_logprobs = None
@@ -410,6 +420,8 @@ class MetadataBuffers:
             self.output_token_logprobs_idx,
             self.output_top_logprobs_val,
             self.output_top_logprobs_idx,
+            self.output_top_p_token_ids_len,
+            self.output_top_p_token_ids,
         ]
         if self.enable_sampling_mask:
             bufs.extend(
@@ -449,6 +461,8 @@ class MetadataBuffers:
             self.output_token_logprobs_idx[idx].clone(),
             self.output_top_logprobs_val[idx].clone(),
             self.output_top_logprobs_idx[idx].clone(),
+            self.output_top_p_token_ids_len[idx].clone(),
+            self.output_top_p_token_ids[idx].clone(),
             sampling_mask_len,
             sampling_mask_idx,
             sampling_logprobs,
@@ -484,6 +498,7 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][4] = image_t
         self.cached_tokens[req.metadata_buffer_index][5] = audio_t
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
+        self.output_top_p_token_ids_len[req.metadata_buffer_index][0] = 0
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
@@ -516,7 +531,30 @@ class MetadataBuffers:
                 ] = torch.tensor(
                     req.logprob.output_top_logprobs_idx[0],
                     dtype=torch.int32,
-                    device="cpu",
+                    device=self.output_top_logprobs_idx.device,
+                )
+            if req.logprob.output_top_p_token_ids:
+                token_ids = req.logprob.output_top_p_token_ids[0]
+                if len(token_ids) > MAX_PD_TOP_P_TOKEN_IDS:
+                    logger.warning(
+                        "PD top-p replay support has %s ids; using sampled token only "
+                        "because the metadata capacity is %s.",
+                        len(token_ids),
+                        MAX_PD_TOP_P_TOKEN_IDS,
+                    )
+                    token_ids = [int(req.output_ids[0])]
+                token_count = len(token_ids)
+                self.output_top_p_token_ids_len[req.metadata_buffer_index][0] = (
+                    token_count
+                )
+                self.output_top_p_token_ids[req.metadata_buffer_index][
+                    :token_count
+                ].copy_(
+                    torch.tensor(
+                        token_ids,
+                        dtype=torch.int32,
+                        device=self.output_top_p_token_ids.device,
+                    )
                 )
         if req.return_sampling_mask:
             if not self.enable_sampling_mask:

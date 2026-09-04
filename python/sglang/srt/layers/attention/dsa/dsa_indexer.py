@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -184,6 +185,21 @@ def _broadcast_indexer_topk_from_rank0(
     return topk_indices
 
 
+def _match_head_gate_q_scale(
+    weights: torch.Tensor, q_scale: torch.Tensor
+) -> torch.Tensor:
+    """Repeat shared head gates to match per-query-head scales."""
+    if weights.shape[1] < q_scale.shape[1]:
+        if q_scale.shape[1] % weights.shape[1] != 0:
+            raise ValueError(
+                "q_scale head count must be divisible by the shared gate head count"
+            )
+        weights = weights.repeat_interleave(
+            q_scale.shape[1] // weights.shape[1], dim=1
+        )
+    return weights
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     # from sgl_kernel import hadamard_transform
     if _is_hip:
@@ -231,6 +247,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         config=None,
     ):
         super().__init__()
+        env_neox_style = os.environ.get("INDEXER_ROPE_NEOX_STYLE")
+        if env_neox_style is not None:
+            if env_neox_style not in ("0", "1"):
+                raise ValueError(
+                    "INDEXER_ROPE_NEOX_STYLE must be either '0' or '1' when set."
+                )
+            is_neox_style = env_neox_style == "1"
         self.hidden_size = hidden_size
         self.n_heads = index_n_heads
         self.head_dim = index_head_dim
@@ -377,6 +400,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     ):
         weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = weights * self.n_heads**-0.5
+        weights = _match_head_gate_q_scale(weights, q_scale)
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
 
@@ -384,6 +408,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     def _apply_q_scale_and_softmax_scale(
         self, weights: torch.Tensor, q_scale: torch.Tensor
     ):
+        weights = _match_head_gate_q_scale(weights, q_scale)
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
     @torch.compile(dynamic=True)
@@ -408,6 +433,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             max_kv_len = forward_batch.seq_lens_cpu.max().item()
             return max_kv_len <= self.index_topk
         return False
+
+    def _maybe_repeat_query_heads(self, query: torch.Tensor) -> torch.Tensor:
+        if query.shape[1] < 32:
+            assert 32 % query.shape[1] == 0
+            query = query.repeat_interleave(32 // query.shape[1], dim=1)
+        return query
 
     def _get_q_k_bf16(
         self,
@@ -1634,6 +1665,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             query, key, weights_raw = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
             )
+            query = self._maybe_repeat_query_heads(query)
             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
             with torch.cuda.stream(self.alt_stream):
                 self._store_index_k_cache(
@@ -1655,6 +1687,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 enable_dual_stream,
                 forward_batch=forward_batch,
             )
+            query = self._maybe_repeat_query_heads(query)
 
             if enable_dual_stream:
                 current_stream = torch.cuda.current_stream()
