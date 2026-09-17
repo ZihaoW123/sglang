@@ -1,16 +1,3 @@
-# Keep the host launcher compiler workaround local to this service process.
-# This container's /usr/lib64/libm.so linker script points at missing /lib64
-# files. Prefer its valid aarch64 library directory without changing system libs.
-if [ -z "${CC:-}" ] && [ ! -e /lib64/libm.so.6 ] && [ -e /usr/lib/aarch64-linux-gnu/libm.so ]; then
-    hostcc_dir=$(mktemp -d /tmp/sglang-hostcc.XXXXXX) || exit 1
-    cat > "$hostcc_dir/clangxx" <<'HOSTCC'
-#!/bin/sh
-exec /usr/bin/clang++ -L/usr/lib/aarch64-linux-gnu "$@"
-HOSTCC
-    chmod +x "$hostcc_dir/clangxx"
-    export CC="$hostcc_dir/clangxx"
-    trap 'rm -f "$hostcc_dir/clangxx"; rmdir "$hostcc_dir"' EXIT
-fi
 
 export PYTHONPATH=`pwd`/python:$PYTHONPATH
 

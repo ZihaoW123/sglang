@@ -66,8 +66,12 @@ class AscendTransferEngine(MooncakeTransferEngine):
         if transfer_protocol is None or transfer_protocol == "sdma":
             trans_op_type = TransferEngine.TransDataOpType.SDMA
         else:
-            trans_op_type = TransferEngine.TransDataOpType.DEVICE_RDMA
-            """with device RDMA for PD transfer"""
+            trans_op_type = (
+                TransferEngine.TransDataOpType.DEVICE_URMA
+                if transfer_protocol == "device_urma"
+                else TransferEngine.TransDataOpType.DEVICE_RDMA
+            )
+            """Initialize HCCL before device transport initialization."""
             tmp_tensor = torch.zeros(1, device="npu")
             output_tensor_list = [
                 torch.empty_like(tmp_tensor) for _ in range(get_world_size())
@@ -100,7 +104,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
     @staticmethod
     def _get_transfer_protocol():
         protocol = os.getenv("ASCEND_MF_TRANSFER_PROTOCOL")
-        allowed_protocols = {"device_rdma", "sdma"}
+        allowed_protocols = {"device_rdma", "device_urma", "sdma"}
         if protocol and protocol.lower() in allowed_protocols:
             return protocol.lower()
         else:
