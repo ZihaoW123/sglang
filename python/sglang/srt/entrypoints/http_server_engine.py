@@ -35,7 +35,7 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
                     "Authorization": f"Bearer {server_args.api_key}",
                 }
                 response = session.get(
-                    f"{base_url}/health_generate", headers=headers, verify=ssl_verify
+                    f"{base_url}/health", headers=headers, verify=ssl_verify
                 )
                 if response.status_code == 200:
                     return p

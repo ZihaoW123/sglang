@@ -1,10 +1,12 @@
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
 
+import sglang.srt.models.glm5_next as glm5_next_module
 from sglang.srt.models.glm5_next import (
     Glm5NextForConditionalGeneration,
     Glm5NextModel,
@@ -12,6 +14,39 @@ from sglang.srt.models.glm5_next import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def test_glm5_next_language_model_only_bypasses_multimodal_path(monkeypatch):
+    class LanguageModel(nn.Module):
+        def forward(self, **kwargs):
+            assert kwargs["input_embeds"] is None
+            return torch.ones(2, 3)
+
+    model = Glm5NextForConditionalGeneration.__new__(Glm5NextForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.language_model_only = True
+    model.is_mrope_enabled = False
+    model.model = LanguageModel()
+    model.capture_aux_hidden_states = False
+    model.pp_group = SimpleNamespace(is_last_rank=False)
+    monkeypatch.setattr(
+        glm5_next_module,
+        "get_attn_tp_context",
+        lambda: SimpleNamespace(maybe_input_scattered=lambda _batch: nullcontext()),
+    )
+    monkeypatch.setattr(
+        glm5_next_module,
+        "general_mm_embed_routine",
+        lambda **_kwargs: pytest.fail("multimodal path must not run"),
+    )
+
+    actual = model(
+        input_ids=torch.ones(2, dtype=torch.long),
+        positions=torch.arange(2),
+        forward_batch=SimpleNamespace(),
+    )
+
+    torch.testing.assert_close(actual, torch.ones(2, 3))
 
 
 def test_glm5_next_dflash_contracts_mhc_hidden_state():

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -16,9 +17,12 @@ class IndexKeyCache:
         self.pool = pool
         num_pages = (index_buf_size + pool.page_size + 1) // pool.page_size
         with (
-            torch.cuda.use_mem_pool(pool.custom_mem_pool)
-            if pool.custom_mem_pool
-            else nullcontext()
+            (
+                torch.cuda.use_mem_pool(pool.custom_mem_pool)
+                if pool.custom_mem_pool
+                else nullcontext()
+            ),
+            pool.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
         ):
             self.buffer = [
                 torch.zeros(

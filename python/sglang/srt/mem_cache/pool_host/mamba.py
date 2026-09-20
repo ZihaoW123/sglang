@@ -50,6 +50,7 @@ class MambaPoolHost(HostKVCache):
         layout: str = "layer_first",
     ):
         self.device_pool = device_pool
+        self.pool_label = "mamba"
         self.page_size = 1
 
         assert layout in [
@@ -130,7 +131,20 @@ class MambaPoolHost(HostKVCache):
         self.kv_buffer = self.init_kv_buffer()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
+        self._host_memory_released = False
         self.clear()
+
+    def _host_derived_attr_names(self):
+        return super()._host_derived_attr_names() + (
+            "temporal_buffer",
+            "conv_buffer",
+            "temporal_staging_buffer",
+            "conv_staging_buffers",
+        )
+
+    def _init_host_buffers(self) -> None:
+        self.kv_buffer = self.init_kv_buffer()
+        self._init_write_back_staging_buffers()
 
     def init_kv_buffer(self):
         _host_alloc = ALLOC_MEMORY_FUNCS[self.device_pool.device]

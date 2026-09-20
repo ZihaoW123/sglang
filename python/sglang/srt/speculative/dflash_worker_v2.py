@@ -2293,6 +2293,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 logits_output,
                 out_tokens.reshape(-1),
                 chain_stride=block_size,
+                accept_lens=commit_lens,
             )
 
         if self._need_mamba_verify_commit:

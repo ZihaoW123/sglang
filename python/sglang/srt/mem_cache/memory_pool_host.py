@@ -170,6 +170,12 @@ class LogicalHostPool:
     def get_ksize_per_token(self):
         return 0
 
+    def release_memory_occupation(self) -> None:
+        pass
+
+    def resume_memory_occupation(self) -> None:
+        pass
+
 
 class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
     """Host mirror for a DeepSeek V4 paged KV/indexer sub-pool."""

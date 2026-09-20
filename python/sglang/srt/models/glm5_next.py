@@ -1136,6 +1136,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         text_config = config.text_config
         self.encoder_only = bool(getattr(config, "encoder_only", False))
         self.language_only = bool(getattr(config, "language_only", False))
+        self.language_model_only = bool(getattr(config, "language_model_only", False))
 
         self.fuse_qkv_a_proj = (
             not self.encoder_only
@@ -1193,15 +1194,17 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
         self.visual = None
-        if not self.language_only:
+        if not self.language_only and not self.language_model_only:
             self.visual = Glm5NextVisionModel(
                 config.vision_config,
                 quant_config=quant_config,
                 prefix=add_prefix("visual", prefix),
                 use_data_parallel=self.use_data_parallel,
             )
-        self.is_mrope_enabled = not self.encoder_only and "mrope_section" in (
-            self.config.rope_scaling or {}
+        self.is_mrope_enabled = (
+            not self.encoder_only
+            and not self.language_model_only
+            and "mrope_section" in (self.config.rope_scaling or {})
         )
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -1366,14 +1369,23 @@ class Glm5NextForConditionalGeneration(nn.Module):
             positions = forward_batch.mrope_positions
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            hidden_states = general_mm_embed_routine(
-                input_ids=input_ids,
-                forward_batch=forward_batch,
-                language_model=self.model,
-                multimodal_model=self,
-                positions=positions,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
+            if self.language_model_only:
+                hidden_states = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    input_embeds=input_embeds,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+            else:
+                hidden_states = general_mm_embed_routine(
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    language_model=self.model,
+                    multimodal_model=self,
+                    positions=positions,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
@@ -1452,10 +1464,24 @@ class Glm5NextForConditionalGeneration(nn.Module):
             is_visual_weight = "visual" in name
             if getattr(self, "encoder_only", False) and not is_visual_weight:
                 continue
-            if getattr(self, "language_only", False) and is_visual_weight:
+            if (
+                getattr(self, "language_only", False)
+                or getattr(self, "language_model_only", False)
+            ) and is_visual_weight:
                 continue
 
             name = _remap_glm5_next_weight_name(name)
+            # A reduced checkpoint can link an original shard that also holds
+            # later layers. Its index lists only selected tensors, but the
+            # safetensors iterator still yields every tensor in that shard.
+            if not is_nextn and name.startswith("model.layers."):
+                layer_name = name.split(".", 3)
+                if (
+                    len(layer_name) > 3
+                    and layer_name[2].isdigit()
+                    and int(layer_name[2]) >= self.config.num_hidden_layers
+                ):
+                    continue
             if "model.visual." in name:
                 name = name.replace("model.visual.", "visual.")
 

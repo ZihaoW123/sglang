@@ -2836,6 +2836,11 @@ class ServerArgs:
         ),
         NS("memory"),
     ] = "mooncake"
+    release_hicache: A[
+        bool,
+        "Release hierarchical-cache host memory while the KV-cache memory region is released.",
+        NS("memory"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
@@ -3337,6 +3342,11 @@ class ServerArgs:
         ),
         NS("model"),
     ] = None
+    custom_pull_weights_pre_read_hook: A[
+        Optional[str],
+        "Import path of a hook(source_dir, target_version) invoked before /pull_weights reads a published version.",
+        NS("model"),
+    ] = None
     weight_loader_disable_mmap: A[
         bool, "Disable mmap while loading weight using safetensors.", NS("model")
     ] = False
@@ -3791,7 +3801,10 @@ class ServerArgs:
 
     # ===== END TO BE REFACTORED ====
 
-    LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
+    LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
+        "MuseGlimmerForConditionalGeneration",
+        "Glm5NextForConditionalGeneration",
+    )
 
     # The attention-backend allow-list is enforced via
     # --enable-page-major-kv-layout (implied by the unified pool in

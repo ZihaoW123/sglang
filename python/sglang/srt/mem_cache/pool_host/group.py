@@ -175,6 +175,18 @@ class HostPoolGroup:
         for entry in self.entries:
             entry.host_pool.clear()
 
+    def release_memory_occupation(self) -> None:
+        for entry in self.entries:
+            release = getattr(entry.host_pool, "release_memory_occupation", None)
+            if release is not None:
+                release()
+
+    def resume_memory_occupation(self) -> None:
+        for entry in self.entries:
+            resume = getattr(entry.host_pool, "resume_memory_occupation", None)
+            if resume is not None:
+                resume()
+
     def destroy(self) -> None:
         for entry in self.entries:
             entry.host_pool.destroy()

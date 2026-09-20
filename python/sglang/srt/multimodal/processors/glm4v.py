@@ -7,7 +7,11 @@ import numpy as np
 import torch
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
@@ -481,6 +485,39 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             # Note: For GLM4v videos, it uses the video token before tokenization but uses image token after tokenization
             video_token_id=self.IM_TOKEN_ID,
         ).build(_processor)
+
+    def get_mm_data(self, prompt, embeddings, img_grid_thw):
+        input_ids, offsets, _ = self.build_input_ids(prompt, img_grid_thw=img_grid_thw)
+        image_embeddings = (
+            embeddings.get(Modality.IMAGE, embeddings)
+            if isinstance(embeddings, dict)
+            else embeddings
+        )
+        mm_items = [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                offsets=offsets,
+                precomputed_embeddings=image_embeddings,
+            )
+        ]
+
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_glm4v(
+            input_ids=torch.tensor(input_ids, dtype=torch.long).unsqueeze(0),
+            hf_config=self.hf_config,
+            image_grid_thw=img_grid_thw,
+            video_grid_thw=None,
+            attention_mask=None,
+        )
+
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=mm_items,
+            im_start_id=self.IM_START_TOKEN_ID,
+            im_end_id=self.IM_END_TOKEN_ID,
+            im_token_id=self.IM_TOKEN_ID,
+            mrope_positions=mrope_positions.squeeze(1),
+            mrope_position_delta=mrope_position_delta,
+        )
 
     def compute_mrope_positions(self, input_ids, mm_items):
         image_grid_thw = None
