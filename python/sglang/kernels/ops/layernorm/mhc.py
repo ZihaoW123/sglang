@@ -1874,7 +1874,7 @@ def _mhc_post_dispatch(
 ) -> torch.Tensor:
     assert x.dim() == 2 and residual.dim() == 3
     assert post_layer_mix.dim() == 3 and comb_res_mix.dim() == 3
-    if is_npu() and not is_npu_a5():
+    if is_npu():
         return torch.ops.custom.npu_hc_post(
             x, residual, post_layer_mix.squeeze(-1), comb_res_mix
         )
@@ -1909,7 +1909,7 @@ def hc_pre(
 
     fn = hc_fn if hc_norm_weight is None else hc_fn * hc_norm_weight
     residual_3d = x.view(s, hc_mult, hidden_size)
-    if is_npu() and not is_npu_a5():
+    if is_npu():
         y, post, comb = torch.ops.custom.npu_hc_pre(
             residual_3d,
             fn,
