@@ -338,7 +338,16 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         return cache_seqlens
 
     def _cache_seqlens_cpu_max(self, forward_batch: ForwardBatch) -> int:
-        """Return the effective maximum KV length from the existing CPU mirror."""
+        """Return the effective width used to slice the page table.
+
+        With the CPU seq-lens mirror disabled (``needs_cpu_seq_lens=False``) no
+        host-side length is available, so fall back to the full ``req_to_token``
+        width. This mirrors AscendAttnBackend's mirror-free block-table path and
+        keeps capture/replay widths identical.
+        """
+        if not self.needs_cpu_seq_lens:
+            return int(self.req_to_token_pool.req_to_token.shape[1])
+
         assert forward_batch.seq_lens_cpu is not None
         seq_lens_cpu = forward_batch.seq_lens_cpu[: forward_batch.batch_size]
         max_seq_len = (
