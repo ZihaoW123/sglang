@@ -560,6 +560,13 @@ class Glm5NextLinearAttention(nn.Module):
             )
 
         if not forward_batch.forward_mode.is_decode():
+            # The Ascend KDA custom kernels consume the same gate contract as
+            # Kimi KDA: a head-shaped forget gate and a pre-activated beta for
+            # regular extend. Decode and target-verify activate beta in-kernel.
+            if is_npu():
+                forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
+                if not forward_batch.forward_mode.is_target_verify():
+                    beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 

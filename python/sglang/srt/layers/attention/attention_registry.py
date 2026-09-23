@@ -519,12 +519,21 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             else:
                 linear_attn_backend = KDAAttnBackend(runner)
         elif glm5_next_config(runner.model_config) is not None:
-            linear_attn_backend = KDAAttnBackend(runner)
-            # KDA uses the community target-verify kernels and their per-step
-            # SSM/conv intermediate caches on every device. In particular, it
-            # must not inherit the Ascend GDN wrapper's expanded-window rollback.
-            hybrid_backend_cls = CommunityHybridLinearAttnBackend
-            logger.info("Using community hybrid linear attention backend for KDA.")
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.attention.ascend_kda_backend import (
+                    AscendKDAAttnBackend,
+                    AscendKDAHybridLinearAttnBackend,
+                )
+
+                linear_attn_backend = AscendKDAAttnBackend(runner)
+                hybrid_backend_cls = AscendKDAHybridLinearAttnBackend
+                logger.info("Using Ascend hybrid linear attention backend for GLM5 KDA.")
+            else:
+                linear_attn_backend = KDAAttnBackend(runner)
+                # KDA uses the community target-verify kernels and their per-step
+                # SSM/conv intermediate caches on non-NPU devices.
+                hybrid_backend_cls = CommunityHybridLinearAttnBackend
+                logger.info("Using community hybrid linear attention backend for KDA.")
         elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:
