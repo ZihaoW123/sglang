@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # 244: bash start_a5_bf16_2node.sh 0
 # 248: bash start_a5_bf16_2node.sh 1
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
+
 cd "$(dirname "$0")" || exit 1
 NODE_RANK=${1:?Usage: bash start_a5_bf16_2node.sh 0_or_1}
 [[ "$NODE_RANK" == 0 || "$NODE_RANK" == 1 ]] || exit 1

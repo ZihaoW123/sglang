@@ -2,7 +2,8 @@
 # Run in glmx: bash start_a5_W8A8_MXFP8_pd.sh
 # P: 248 / pxc_glm53_flash; D: 244 / pxc_glm53_flash_v2
 # Router on 248: bash start_a5_W8A8_MXFP8_pd.sh router
-
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
 cd "$(dirname "$0")" || exit 1
 MODEL_PATH=/mnt/share/w00936111/weights/GLM-5.3-Flash-0day-A5-convert
 PREFILL_IP=141.61.54.248
