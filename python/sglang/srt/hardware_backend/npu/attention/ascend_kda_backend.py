@@ -1,4 +1,6 @@
+import logging
 import math
+import os
 from typing import Optional
 
 import torch
@@ -25,6 +27,38 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _LOG2_E = math.log2(math.e)
+logger = logging.getLogger(__name__)
+
+
+def _trim_kda_gate_padding(
+    q: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    packed_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Remove DP-attention's token padding from KDA gate inputs.
+
+    The causal-conv path returns only the packed tokens, while the gate
+    projections retain the padded DP-attention token count.  Padding is
+    appended, so the prefix selected by ``cu_seqlens[-1]`` is the matching
+    gate input for q/k/v.
+    """
+    if q.ndim != 4 or g.ndim != 4 or beta.ndim != 3:
+        raise RuntimeError(
+            "AscendC KDA expects BSND q/g and BSN beta, got "
+            f"q={tuple(q.shape)}, g={tuple(g.shape)}, beta={tuple(beta.shape)}"
+        )
+    if q.shape[1] != packed_tokens:
+        raise RuntimeError(
+            f"KDA q has {q.shape[1]} tokens but cu_seqlens describes "
+            f"{packed_tokens}"
+        )
+    if g.shape[1] < packed_tokens or beta.shape[1] < packed_tokens:
+        raise RuntimeError(
+            "KDA gate inputs are shorter than q: "
+            f"q={tuple(q.shape)}, g={tuple(g.shape)}, beta={tuple(beta.shape)}"
+        )
+    return g[:, :packed_tokens].contiguous(), beta[:, :packed_tokens].contiguous()
 
 
 class _AscendKDAExtendKernel:
@@ -112,6 +146,119 @@ class _AscendKDAExtendKernel:
         return out
 
 
+class _AscendCKDAExtendKernel:
+    """Fused fla-npu AscendC KDA prefill.
+
+    SGLang stores recurrent KDA state in ``[pool, H, V, K]`` BF16, while the
+    fused operator consumes one FP32 state per packed sequence.  Gather the
+    active slots, run the fused chunk kernel, then commit its final states back
+    to the pool.  This avoids the Triton ``scaled_dot_kkt`` autotuner, whose
+    long-sequence candidates can time out on Ascend 910_93.
+    """
+
+    supports_safe_gate = True
+
+    def __init__(self, triton_fallback):
+        try:
+            from fla_npu.ops.ascendc import chunk_kda_fwd
+        except ImportError as exc:
+            raise RuntimeError(
+                "SGLANG_NPU_KDA_PREFILL_BACKEND=ascendc requires fla-npu built "
+                "with chunk_kda_fwd. Run slime-ascend/scripts/"
+                "quick_install_a5_glm53flash.sh first."
+            ) from exc
+        self.chunk_kda_fwd = chunk_kda_fwd
+        self.triton_fallback = triton_fallback
+
+    def extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        return_intermediate_states: bool = False,
+        is_spec_decode: bool = False,
+        **kwargs,
+    ):
+        # Draft extend must remain rollback-able.  The shared Triton path owns
+        # that contract; regular RL rollout prefill commits final state here.
+        if is_spec_decode:
+            return self.triton_fallback.extend(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                return_intermediate_states=return_intermediate_states,
+                is_spec_decode=is_spec_decode,
+                **kwargs,
+            )
+
+        q = l2norm_fwd(q.contiguous())
+        k = l2norm_fwd(k.contiguous())
+        active_indices = cache_indices.to(dtype=torch.long)
+        initial_state = ssm_states.index_select(0, active_indices).float().contiguous()
+        cu_seqlens = tuple(
+            int(offset) for offset in query_start_loc.detach().cpu().tolist()
+        )
+        g, beta = _trim_kda_gate_padding(q, g, beta, cu_seqlens[-1])
+        try:
+            outputs = self.chunk_kda_fwd(
+                q,
+                k,
+                v.contiguous(),
+                g.float().contiguous(),
+                beta.float().contiguous(),
+                float(k.shape[-1] ** -0.5),
+                64,
+                layout="BSND",
+                initial_state=initial_state,
+                output_final_state=True,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=None,
+                # ``g`` was already transformed by fused_kda_gate_npu, including
+                # the model's safe-gate lower bound.
+                safe_gate=False,
+                lower_bound=None,
+                use_gate_in_kernel=False,
+                A_log=None,
+                dt_bias=None,
+                disable_recompute=False,
+                return_intermediate_states=return_intermediate_states,
+                state_v_first=True,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "AscendC KDA prefill failed for "
+                f"q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}, "
+                f"g={tuple(g.shape)}, beta={tuple(beta.shape)}, "
+                f"state={tuple(initial_state.shape)}, cu_seqlens={cu_seqlens}"
+            ) from exc
+        out, final_state, *_, h, _initial_state = outputs
+        if final_state is None:
+            raise RuntimeError("fla-npu chunk_kda_fwd did not return final state")
+        ssm_states.index_copy_(
+            0,
+            active_indices,
+            final_state.to(dtype=ssm_states.dtype),
+        )
+        if return_intermediate_states:
+            if h is None:
+                raise RuntimeError(
+                    "fla-npu chunk_kda_fwd did not return intermediate states"
+                )
+            return out, h
+        return out
+
+
 class AscendKDAAttnBackend(KDAAttnBackend):
     """Ascend implementation of Kimi Delta Attention.
 
@@ -145,7 +292,21 @@ class AscendKDAAttnBackend(KDAAttnBackend):
                 conv_pool_shape[-2],
             )
         )
-        self.kernel_dispatcher.extend_kernel = _AscendKDAExtendKernel()
+        prefill_backend = os.getenv(
+            "SGLANG_NPU_KDA_PREFILL_BACKEND", "ascendc"
+        ).lower()
+        if prefill_backend == "ascendc":
+            self.kernel_dispatcher.extend_kernel = _AscendCKDAExtendKernel(
+                self.kernel_dispatcher.triton_kernel
+            )
+        elif prefill_backend == "triton":
+            self.kernel_dispatcher.extend_kernel = _AscendKDAExtendKernel()
+        else:
+            raise ValueError(
+                "SGLANG_NPU_KDA_PREFILL_BACKEND must be 'ascendc' or 'triton', "
+                f"got {prefill_backend!r}"
+            )
+        logger.info("Ascend KDA prefill backend: %s", prefill_backend)
 
     def _get_conv_weights_t(
         self, layer: RadixLinearAttention, dtype: torch.dtype

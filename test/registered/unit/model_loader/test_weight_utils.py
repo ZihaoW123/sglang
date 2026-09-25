@@ -5,7 +5,14 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.model_loader.weight_utils import filter_duplicate_safetensors_files
+import torch
+from safetensors.torch import save_file
+
+from sglang.srt.model_loader.weight_utils import (
+    buffered_multi_thread_safetensors_weights_iterator,
+    filter_duplicate_safetensors_files,
+    safetensors_weights_iterator,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -82,6 +89,34 @@ class TestFilterDuplicateSafetensorsFiles(CustomTestCase):
             index_file=INDEX_NAME,
         )
         self.assertEqual(result, [single])
+
+    def test_iterators_obey_tensor_to_shard_mapping(self):
+        original = os.path.join(self.folder, "model-00001.safetensors")
+        override = os.path.join(self.folder, "model-reduced-router.safetensors")
+        save_file(
+            {
+                "model.weight": torch.tensor([1.0]),
+                "model.router": torch.arange(288),
+            },
+            original,
+        )
+        save_file({"model.router": torch.arange(16)}, override)
+        weight_map = {
+            "model.weight": os.path.basename(original),
+            "model.router": os.path.basename(override),
+        }
+
+        for iterator in (
+            safetensors_weights_iterator(
+                [original, override], weight_map=weight_map
+            ),
+            buffered_multi_thread_safetensors_weights_iterator(
+                [original, override], max_workers=2, weight_map=weight_map
+            ),
+        ):
+            loaded = dict(iterator)
+            self.assertEqual(set(loaded), {"model.weight", "model.router"})
+            self.assertEqual(tuple(loaded["model.router"].shape), (16,))
 
 
 if __name__ == "__main__":
