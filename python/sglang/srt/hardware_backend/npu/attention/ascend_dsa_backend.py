@@ -21,7 +21,7 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     KPoolExtendPlan,
     KPoolWritePlan,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -246,6 +246,21 @@ class AscendDSAAttnBackend(AscendAttnBackend):
 
     def _create_forward_metadata(self) -> AscendDSAForwardMetadata:
         return AscendDSAForwardMetadata(page_size=self.page_size)
+
+    def _init_cuda_graph_metadata(
+        self,
+        bs: int,
+        forward_mode: ForwardMode,
+        seq_lens: torch.Tensor,
+        out_cache_loc: Optional[torch.Tensor] = None,
+    ) -> AscendDSAForwardMetadata:
+        metadata = super()._init_cuda_graph_metadata(
+            bs, forward_mode, seq_lens, out_cache_loc
+        )
+        # DSA derives effective lengths from the raw graph inputs after the base
+        # update. Keep a separate buffer for each backend and capture bucket.
+        metadata.seq_lens = seq_lens.clone()
+        return metadata
 
     def _query_lens_device(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Return per-request query lengths without a device-host round trip."""

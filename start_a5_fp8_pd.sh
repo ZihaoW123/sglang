@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# Run in glmx: bash start_a5_W8A8_MXFP8_pd.sh
+# Run in glmx: bash start_a5_fp8_pd.sh
 # P: 248 / pxc_glm53_flash; D: 244 / pxc_glm53_flash_v2
-# Router on 248: bash start_a5_W8A8_MXFP8_pd.sh router
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
+# Router on 248: bash start_a5_fp8_pd.sh router
+
 cd "$(dirname "$0")" || exit 1
-MODEL_PATH=/mnt/share/w00936111/weights/GLM-5.3-Flash-0day-A5-convert
+MODEL_PATH=/mnt/share/w00936111/weights/GLM-5.3-Flash
 PREFILL_IP=141.61.54.248
 DECODE_IP=141.61.54.244
 LOCAL_IPS=" $(hostname -I) "
@@ -32,6 +31,23 @@ export SGLANG_OPT_USE_TILELANG_MHC_PRE=False
 export SGLANG_OPT_USE_TILELANG_MHC_POST=False
 export SGLANG_NPU_PROFILING=0
 export HCCL_BUFFSIZE=256
+export DEEPEP_HCCL_BUFFSIZE=2048
+export HCCL_CONNECT_TIMEOUT=300
+export HCCL_EXEC_TIMEOUT=68
+export HCCL_OP_EXPANSION_MODE=AIV
+export ACL_DEVICE_SYNC_TIMEOUT=60
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+export ASCEND_USE_FIA=1
+export SGLANG_NPU_USE_MLAPO=0
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=35
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export TRANSFORMERS_VERBOSITY=error
+export HCCL_HOST_SOCKET_PORT_RANGE=auto
+export GLOO_SOCKET_IFNAME=data0.3001
+export HCCL_SOCKET_IFNAME=data0.3001
+unset HCCL_IF_IP HCCL_SOCKET_FAMILY RANK_TABLE_FILE
 export ASCEND_MF_STORE_URL="tcp://$PREFILL_IP:24670"
 export ASCEND_MF_TRANSFER_PROTOCOL=device_urma
 unset ASCEND_LAUNCH_BLOCKING
@@ -42,38 +58,40 @@ if [[ "$LOCAL_IPS" == *" $PREFILL_IP "* ]]; then
     export SGLANG_HOST_IP="$PREFILL_IP"
     exec python3 -m sglang.launch_server \
         --model-path "$MODEL_PATH" \
-        --quantization modelslim --load-format auto \
+        --quantization fp8 --kv-cache-dtype bf16 --load-format auto \
         --device npu --attention-backend ascend --trust-remote-code \
-        --served-model-name GLM-NEXT \
+        --served-model-name glm53flash \
         --disaggregation-mode prefill \
         --disaggregation-bootstrap-port 8998 \
         --disaggregation-transfer-backend ascend \
         --tp-size 8 --pp-size 1 --dp-size 2 --enable-dp-attention --nnodes 1 \
         --chunked-prefill-size 16384 --max-prefill-tokens 16384 \
-        --mem-fraction-static 0.83 --page-size 64 --max-running-requests 16 \
+        --mem-fraction-static 0.84 --page-size 64 --max-running-requests 16 \
         --speculative-draft-model-path "$MODEL_PATH" \
-        --speculative-draft-kv-cache-dtype bf16 \
+        --speculative-draft-kv-cache-dtype bf16 --speculative-draft-model-quantization fp8 \
         --speculative-algorithm NEXTN --speculative-num-steps 4 \
         --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
+        --moe-a2a-backend none --enable-metrics \
         --pre-warm-nccl --watchdog-timeout 1200 --cuda-graph-bs 1 8 64 \
         --host "$PREFILL_IP" --port 8810
 elif [[ "$LOCAL_IPS" == *" $DECODE_IP "* ]]; then
     export SGLANG_HOST_IP="$DECODE_IP"
     exec python3 -m sglang.launch_server \
         --model-path "$MODEL_PATH" \
-        --quantization modelslim --load-format auto \
+        --quantization fp8 --kv-cache-dtype bf16 --load-format auto \
         --device npu --attention-backend ascend --trust-remote-code \
-        --served-model-name GLM-NEXT \
+        --served-model-name glm53flash \
         --disaggregation-mode decode \
         --disaggregation-bootstrap-port 8998 \
         --disaggregation-transfer-backend ascend \
         --tp-size 8 --pp-size 1 --dp-size 2 --enable-dp-attention --nnodes 1 \
         --chunked-prefill-size 16384 --max-prefill-tokens 16384 \
-        --mem-fraction-static 0.83 --page-size 64 --max-running-requests 16 \
+        --mem-fraction-static 0.84 --page-size 64 --max-running-requests 16 \
         --speculative-draft-model-path "$MODEL_PATH" \
-        --speculative-draft-kv-cache-dtype bf16 \
+        --speculative-draft-kv-cache-dtype bf16 --speculative-draft-model-quantization fp8 \
         --speculative-algorithm NEXTN --speculative-num-steps 4 \
         --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
+        --moe-a2a-backend none --enable-metrics \
         --pre-warm-nccl --watchdog-timeout 1200 --cuda-graph-bs 1 8 64 \
         --host "$DECODE_IP" --port 8811
 else

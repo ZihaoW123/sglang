@@ -174,8 +174,7 @@ def init_npu_backend():
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
     try:
-        if not is_npu_a5():
-            import custom_ops  # noqa: F401
+        import custom_ops      # noqa: F401
         import sgl_kernel_npu  # noqa: F401
     except ImportError as e:
         logger.warning("NPU custom kernel packages unavailable: %s", e)
