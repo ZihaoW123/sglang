@@ -116,7 +116,6 @@ from sglang.srt.model_loader.weight_utils import (
     gguf_quant_weights_iterator,
     initialize_capture_safe_weights,
     initialize_dummy_weights,
-    load_safetensors_index_weight_map,
     maybe_add_mtp_safetensors,
     multi_thread_pt_weights_iterator,
     np_cache_weights_iterator,
@@ -578,14 +577,6 @@ class DefaultModelLoader(BaseModelLoader):
             hf_weights_files = list(resolved_source.weight_files)
             use_safetensors = resolved_source.use_safetensors
 
-        weight_map = (
-            load_safetensors_index_weight_map(
-                hf_folder, "model.safetensors.index.json"
-            )
-            if use_safetensors
-            else None
-        )
-
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -654,7 +645,6 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
-                    weight_map=weight_map,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -663,7 +653,6 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
-                    weight_map=weight_map,
                 )
 
         else:
